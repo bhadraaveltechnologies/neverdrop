@@ -1,0 +1,778 @@
+/**
+ * Reference billing core for a Bhadraavel app: plans, coupons, Razorpay
+ * orders, verification, the webhook, and the access rule.
+ *
+ * Framework- and database-free on purpose: everything it reads or writes goes
+ * through `BillingStore` (see schema.sql for the tables and
+ * memory-store.ts for a working in-memory version the tests use). Port the
+ * store to the app's database (Drizzle, Prisma, Knex, SQL) and keep this file
+ * as it is.
+ *
+ * In the skill this file is billing.ts.txt, so that apps' test runners and
+ * linters leave it alone inside .claude/skills/; copy it into the app as
+ * billing.ts. The SkillFactory's scripts/test-references.sh runs its tests.
+ *
+ * Money is always an integer in the currency's smallest unit (paise for INR,
+ * cents for USD). Nothing here trusts a price, a discount or an amount sent by
+ * the browser: the server prices every order itself.
+ */
+import crypto from "node:crypto";
+
+// ---------------------------------------------------------------- types
+
+export type Plan = {
+  id: string; // "monthly", "quarterly", "yearly", "family-yearly"…
+  name: string;
+  description?: string;
+  days: number;
+  amount: number; // smallest unit, taxes included
+  currency: string; // "INR"
+  active: boolean;
+  sort: number;
+};
+
+export type CouponKind = "percent" | "amount";
+export type Coupon = {
+  code: string; // stored upper-case
+  kind: CouponKind;
+  /** percent: 1–100; amount: smallest unit, in `currency`. */
+  value: number;
+  currency: string | null; // required for "amount"
+  /** Plans it applies to; null = every plan. */
+  planIds: string[] | null;
+  /** Total redemptions allowed; null = unlimited. */
+  maxRedemptions: number | null;
+  /** Redemptions allowed per account (usually 1). */
+  perUserLimit: number;
+  validFrom: Date | null;
+  validUntil: Date | null;
+  /** Only this account may use it (an offer to one person); null = anyone. */
+  email: string | null;
+  /** Only for an account that has never paid before. */
+  firstPurchaseOnly: boolean;
+  active: boolean;
+  note: string | null;
+  createdAt: Date;
+};
+
+export type SubscriptionSource = "razorpay" | "coupon" | "admin" | "trial";
+export type Subscription = {
+  id: string;
+  userId: string;
+  planId: string;
+  days: number;
+  startsAt: Date;
+  endsAt: Date;
+  source: SubscriptionSource;
+  amount: number;
+  currency: string;
+  paymentRef: string | null;
+  couponCode: string | null;
+  note: string | null;
+  createdAt: Date;
+};
+
+export type PaymentStatus = "created" | "paid" | "failed" | "refunded";
+export type Payment = {
+  id: string;
+  userId: string;
+  planId: string;
+  /** Razorpay's order id, or free_<id> when a coupon covered the whole price. */
+  orderId: string;
+  paymentId: string | null;
+  listAmount: number;
+  discount: number;
+  amount: number;
+  currency: string;
+  couponCode: string | null;
+  status: PaymentStatus;
+  method: string | null;
+  error: string | null;
+  subscriptionId: string | null;
+  createdAt: Date;
+  paidAt: Date | null;
+};
+
+export type Redemption = {
+  couponCode: string;
+  userId: string;
+  paymentId: string; // our payments.id
+  discount: number;
+  createdAt: Date;
+};
+
+export type BillingUser = { id: string; email: string; createdAt: Date; isAdmin?: boolean };
+
+/**
+ * What the core needs from the database. `transaction` must give the callback
+ * a store whose writes commit together or not at all (SQL: BEGIN … COMMIT);
+ * `claimPayment` must be one conditional UPDATE … WHERE status = 'created'
+ * RETURNING, so exactly one caller wins when the verify route and the
+ * webhook arrive together.
+ */
+export interface BillingStore {
+  transaction<T>(fn: (tx: BillingStore) => Promise<T>): Promise<T>;
+  listPlans(): Promise<Plan[]>;
+  upsertPlan(plan: Plan): Promise<Plan>;
+  getCoupon(code: string): Promise<Coupon | null>;
+  insertCoupon(coupon: Coupon): Promise<Coupon>;
+  updateCoupon(code: string, patch: Partial<Coupon>): Promise<Coupon | null>;
+  listCoupons(): Promise<Coupon[]>;
+  countRedemptions(code: string, userId?: string): Promise<number>;
+  insertRedemption(r: Redemption): Promise<void>;
+  listSubscriptions(userId: string): Promise<Subscription[]>;
+  insertSubscription(s: Omit<Subscription, "id" | "createdAt">): Promise<Subscription>;
+  updateSubscription(id: string, patch: Partial<Subscription>): Promise<Subscription | null>;
+  countPaidPayments(userId: string): Promise<number>;
+  insertPayment(p: Omit<Payment, "createdAt">): Promise<Payment>;
+  getPaymentByOrder(orderId: string): Promise<Payment | null>;
+  /** UPDATE payments SET … WHERE order_id = $1 AND status = $2 RETURNING *. */
+  claimPayment(orderId: string, from: PaymentStatus, patch: Partial<Payment>): Promise<Payment | null>;
+  updatePayment(id: string, patch: Partial<Payment>): Promise<Payment | null>;
+}
+
+export type BillingConfig = {
+  /** BILLING_ENABLED=true; off means everyone is let in and nothing is sold. */
+  enabled: boolean;
+  /** TRIAL_DAYS; 0 = no trial. A trial is a subscription row, granted once. */
+  trialDays: number;
+  appId: string; // goes into Razorpay notes and receipts
+  keyId: string; // RAZORPAY_KEY_ID (public, sent to the browser)
+  keySecret: string; // RAZORPAY_KEY_SECRET (server only)
+  webhookSecret: string; // RAZORPAY_WEBHOOK_SECRET (server only)
+};
+
+export const DAY_MS = 24 * 60 * 60 * 1000;
+/** Razorpay will not take an order below 100 of the smallest unit (₹1 / $1). */
+export const MIN_ORDER = 100;
+
+export function configFromEnv(env: Record<string, string | undefined>, appId: string): BillingConfig {
+  const trial = Number(env.TRIAL_DAYS ?? "0");
+  return {
+    enabled: env.BILLING_ENABLED === "true",
+    trialDays: Number.isInteger(trial) && trial > 0 ? trial : 0,
+    appId,
+    keyId: (env.RAZORPAY_KEY_ID ?? "").trim(),
+    keySecret: (env.RAZORPAY_KEY_SECRET ?? "").trim(),
+    webhookSecret: (env.RAZORPAY_WEBHOOK_SECRET ?? "").trim(),
+  };
+}
+
+export const paymentsReady = (cfg: BillingConfig) => Boolean(cfg.keyId && cfg.keySecret);
+
+// ---------------------------------------------------------------- money
+
+const SYMBOL: Record<string, string> = { INR: "₹", USD: "$", EUR: "€", GBP: "£", SGD: "S$", AED: "AED " };
+
+/** "₹49", "₹1,234.50", "$9.99": whole amounts stay whole. */
+export function formatMoney(amount: number, currency = "INR"): string {
+  const whole = amount % 100 === 0;
+  const locale = currency === "INR" ? "en-IN" : "en-US";
+  const n = (amount / 100).toLocaleString(locale, {
+    minimumFractionDigits: whole ? 0 : 2,
+    maximumFractionDigits: 2,
+  });
+  return `${SYMBOL[currency] ?? `${currency} `}${n}`;
+}
+
+// ---------------------------------------------------------------- coupons
+
+export const normalizeCode = (code: string) => code.trim().toUpperCase();
+const CODE_RE = /^[A-Z0-9][A-Z0-9-]{2,31}$/;
+
+export type CouponProblem =
+  | "format"
+  | "unknown"
+  | "inactive"
+  | "not_yet"
+  | "expired"
+  | "plan"
+  | "account"
+  | "used"
+  | "exhausted"
+  | "first_purchase"
+  | "currency";
+
+/** The person-facing sentence for each problem (copy.md has the same lines). */
+export const COUPON_MESSAGES: Record<CouponProblem, string> = {
+  format: "That doesn't look like a coupon code. Check it and try again.",
+  unknown: "We couldn't find that coupon code. Check the spelling and try again.",
+  inactive: "This coupon is no longer available.",
+  not_yet: "This coupon isn't open yet. Please try again from its start date.",
+  expired: "This coupon has expired.",
+  plan: "This coupon doesn't apply to the plan you picked. Try another plan.",
+  account: "This coupon was issued for a different account.",
+  used: "You've already used this coupon.",
+  exhausted: "This coupon has been fully used.",
+  first_purchase: "This coupon is for a first subscription only.",
+  currency: "This coupon can't be used with this plan's currency.",
+};
+
+export type Quote = {
+  plan: Plan;
+  coupon: Coupon | null;
+  listAmount: number;
+  discount: number;
+  amount: number;
+};
+
+/** Price a plan with an (already checked) coupon. The result is never below MIN_ORDER unless it is 0. */
+export function priceWith(plan: Plan, coupon: Coupon | null): Quote {
+  const list = plan.amount;
+  let discount = 0;
+  if (coupon?.kind === "percent") discount = Math.round((list * coupon.value) / 100);
+  if (coupon?.kind === "amount") discount = coupon.value;
+  discount = Math.min(Math.max(discount, 0), list);
+  let amount = list - discount;
+  if (amount > 0 && amount < MIN_ORDER) {
+    // A charge Razorpay would refuse: round the price up to its minimum.
+    amount = Math.min(MIN_ORDER, list);
+    discount = list - amount;
+  }
+  return { plan, coupon, listAmount: list, discount, amount };
+}
+
+/** Is this code good for this person and plan right now? */
+export async function checkCoupon(
+  store: BillingStore,
+  input: { code: string; plan: Plan; user: BillingUser },
+  now = new Date(),
+): Promise<{ ok: true; coupon: Coupon } | { ok: false; problem: CouponProblem; message: string }> {
+  const fail = (problem: CouponProblem) => ({ ok: false as const, problem, message: COUPON_MESSAGES[problem] });
+  const code = normalizeCode(input.code);
+  if (!CODE_RE.test(code)) return fail("format");
+  const c = await store.getCoupon(code);
+  if (!c) return fail("unknown");
+  if (!c.active) return fail("inactive");
+  if (c.validFrom && now < c.validFrom) return fail("not_yet");
+  if (c.validUntil && now > c.validUntil) return fail("expired");
+  if (c.planIds && !c.planIds.includes(input.plan.id)) return fail("plan");
+  if (c.kind === "amount" && c.currency && c.currency !== input.plan.currency) return fail("currency");
+  if (c.email && c.email.toLowerCase() !== input.user.email.toLowerCase()) return fail("account");
+  if (c.firstPurchaseOnly && (await store.countPaidPayments(input.user.id)) > 0) return fail("first_purchase");
+  if ((await store.countRedemptions(code, input.user.id)) >= c.perUserLimit) return fail("used");
+  if (c.maxRedemptions !== null && (await store.countRedemptions(code)) >= c.maxRedemptions)
+    return fail("exhausted");
+  return { ok: true, coupon: c };
+}
+
+export type NewCoupon = {
+  code: string;
+  kind: CouponKind;
+  value: number;
+  currency?: string | null;
+  planIds?: string[] | null;
+  maxRedemptions?: number | null;
+  perUserLimit?: number;
+  validFrom?: Date | null;
+  validUntil?: Date | null;
+  email?: string | null;
+  firstPurchaseOnly?: boolean;
+  note?: string | null;
+};
+
+/** Admin: make a coupon. Throws a sentence the admin screen can show as is. */
+export async function createCoupon(store: BillingStore, input: NewCoupon, now = new Date()): Promise<Coupon> {
+  const code = normalizeCode(input.code);
+  if (!CODE_RE.test(code)) throw new Error("A code is 3 to 32 letters, digits or dashes, starting with a letter or digit.");
+  if (await store.getCoupon(code)) throw new Error(`The code ${code} is already taken.`);
+  if (input.kind === "percent" && !(Number.isInteger(input.value) && input.value >= 1 && input.value <= 100))
+    throw new Error("A percent discount is a whole number from 1 to 100.");
+  if (input.kind === "amount") {
+    if (!(Number.isInteger(input.value) && input.value > 0))
+      throw new Error("An amount discount is a whole number of paise (or cents) above zero.");
+    if (!input.currency) throw new Error("An amount discount needs its currency, e.g. INR.");
+  }
+  const perUser = input.perUserLimit ?? 1;
+  if (!(Number.isInteger(perUser) && perUser >= 1)) throw new Error("Uses per account is a whole number, 1 or more.");
+  if (input.maxRedemptions != null && !(Number.isInteger(input.maxRedemptions) && input.maxRedemptions >= 1))
+    throw new Error("Total uses is a whole number, 1 or more (or empty for no limit).");
+  if (input.validFrom && input.validUntil && input.validUntil <= input.validFrom)
+    throw new Error("The end date must be after the start date.");
+  if (input.planIds?.length) {
+    const known = new Set((await store.listPlans()).map((p) => p.id));
+    const bad = input.planIds.filter((p) => !known.has(p));
+    if (bad.length) throw new Error(`No such plan: ${bad.join(", ")}.`);
+  }
+  return store.insertCoupon({
+    code,
+    kind: input.kind,
+    value: input.value,
+    currency: input.kind === "amount" ? (input.currency ?? null) : null,
+    planIds: input.planIds?.length ? input.planIds : null,
+    maxRedemptions: input.maxRedemptions ?? null,
+    perUserLimit: perUser,
+    validFrom: input.validFrom ?? null,
+    validUntil: input.validUntil ?? null,
+    email: input.email ? input.email.trim().toLowerCase() : null,
+    firstPurchaseOnly: input.firstPurchaseOnly ?? false,
+    active: true,
+    note: input.note ?? null,
+    createdAt: now,
+  });
+}
+
+// ---------------------------------------------------------------- access
+
+export type AccessStatus = "off" | "active" | "trial" | "none";
+export type Access = {
+  status: AccessStatus;
+  /** True when the portal must stay closed and the person be sent to /pricing. */
+  blocked: boolean;
+  current: Subscription | null;
+  /** The last day of everything already bought (stacked periods included). */
+  paidUntil: Date | null;
+  daysLeft: number | null;
+};
+
+const daysBetween = (end: Date, now: Date) => Math.max(0, Math.ceil((end.getTime() - now.getTime()) / DAY_MS));
+
+/**
+ * The rule: with billing on, a person may use the app only while a
+ * subscription row covers today. No row (never subscribed, trial over, plan
+ * over) = blocked. Admins are never blocked, so they can always reach the
+ * admin screens.
+ */
+export async function accessFor(
+  store: BillingStore,
+  user: BillingUser,
+  cfg: BillingConfig,
+  now = new Date(),
+): Promise<Access> {
+  if (!cfg.enabled) return { status: "off", blocked: false, current: null, paidUntil: null, daysLeft: null };
+  const subs = await store.listSubscriptions(user.id);
+  const current = subs.find((s) => s.startsAt <= now && s.endsAt > now) ?? null;
+  const future = subs.filter((s) => s.endsAt > now);
+  const paidUntil = future.length ? new Date(Math.max(...future.map((s) => s.endsAt.getTime()))) : null;
+  if (!current) return { status: "none", blocked: !user.isAdmin, current: null, paidUntil, daysLeft: 0 };
+  return {
+    status: current.source === "trial" ? "trial" : "active",
+    blocked: false,
+    current,
+    paidUntil,
+    daysLeft: paidUntil ? daysBetween(paidUntil, now) : 0,
+  };
+}
+
+/** Add a period after everything already bought, or from now. */
+export async function grantPeriod(
+  store: BillingStore,
+  g: {
+    userId: string;
+    planId: string;
+    days: number;
+    source: SubscriptionSource;
+    amount?: number;
+    currency?: string;
+    paymentRef?: string | null;
+    couponCode?: string | null;
+    note?: string | null;
+  },
+  now = new Date(),
+): Promise<Subscription> {
+  if (!(Number.isInteger(g.days) && g.days > 0)) throw new Error("Days must be a whole number above zero.");
+  const subs = await store.listSubscriptions(g.userId);
+  const lastEnd = subs.reduce((m, s) => (s.endsAt > m ? s.endsAt : m), now);
+  const startsAt = lastEnd > now ? lastEnd : now;
+  return store.insertSubscription({
+    userId: g.userId,
+    planId: g.planId,
+    days: g.days,
+    startsAt,
+    endsAt: new Date(startsAt.getTime() + g.days * DAY_MS),
+    source: g.source,
+    amount: g.amount ?? 0,
+    currency: g.currency ?? "INR",
+    paymentRef: g.paymentRef ?? null,
+    couponCode: g.couponCode ?? null,
+    note: g.note ?? null,
+  });
+}
+
+/**
+ * The free trial, granted once per account as a subscription row (so "no
+ * subscription = no access" stays true). Call it at sign-up, and lazily from
+ * the gate for accounts made before billing was switched on.
+ */
+export async function ensureTrial(
+  store: BillingStore,
+  user: BillingUser,
+  cfg: BillingConfig,
+  now = new Date(),
+): Promise<Subscription | null> {
+  if (!cfg.enabled || cfg.trialDays <= 0) return null;
+  const subs = await store.listSubscriptions(user.id);
+  if (subs.some((s) => s.source === "trial")) return null;
+  if (subs.length > 0) return null; // already a customer: no trial on top
+  return grantPeriod(
+    store,
+    { userId: user.id, planId: "trial", days: cfg.trialDays, source: "trial", note: "Free trial" },
+    now,
+  );
+}
+
+// ---------------------------------------------------------------- razorpay
+
+export type RazorpayPayment = {
+  id: string;
+  order_id?: string;
+  amount?: number;
+  currency?: string;
+  status?: string; // created | authorized | captured | refunded | failed
+  method?: string;
+  email?: string;
+  error_description?: string;
+  error_reason?: string;
+};
+
+export type RazorpayApi = {
+  createOrder(body: {
+    amount: number;
+    currency: string;
+    receipt: string;
+    notes: Record<string, string>;
+  }): Promise<{ id: string; amount: number; currency: string }>;
+  fetchPayment(paymentId: string): Promise<RazorpayPayment>;
+  capture(paymentId: string, amount: number, currency: string): Promise<RazorpayPayment>;
+  refund(paymentId: string, amount?: number, notes?: Record<string, string>): Promise<{ id: string; status: string }>;
+};
+
+/** Razorpay's REST API with fetch and Basic auth: no SDK needed. */
+export function razorpayApi(cfg: BillingConfig, fetchImpl: typeof fetch = fetch): RazorpayApi {
+  const auth = Buffer.from(`${cfg.keyId}:${cfg.keySecret}`).toString("base64");
+  async function call<T>(path: string, method = "GET", body?: unknown): Promise<T> {
+    const res = await fetchImpl(`https://api.razorpay.com/v1${path}`, {
+      method,
+      headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(15_000),
+    });
+    const data = (await res.json().catch(() => ({}))) as { error?: { description?: string } };
+    if (!res.ok) throw new Error(data.error?.description ? `Razorpay: ${data.error.description}` : `Razorpay responded ${res.status}`);
+    return data as T;
+  }
+  return {
+    createOrder: (b) => call("/orders", "POST", b),
+    fetchPayment: (id) => call(`/payments/${encodeURIComponent(id)}`),
+    capture: (id, amount, currency) => call(`/payments/${encodeURIComponent(id)}/capture`, "POST", { amount, currency }),
+    refund: (id, amount, notes) =>
+      call(`/payments/${encodeURIComponent(id)}/refund`, "POST", { ...(amount ? { amount } : {}), ...(notes ? { notes } : {}) }),
+  };
+}
+
+const hmac = (secret: string, text: string) => crypto.createHmac("sha256", secret).update(text).digest("hex");
+const safeEqual = (a: string, b: string) => {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+
+/** Checkout's handler result: HMAC-SHA256 of "order_id|payment_id" with the key secret. */
+export const checkoutSignatureOk = (cfg: BillingConfig, orderId: string, paymentId: string, signature: string) =>
+  Boolean(cfg.keySecret) && safeEqual(hmac(cfg.keySecret, `${orderId}|${paymentId}`), signature);
+
+/** A webhook delivery: HMAC-SHA256 of the raw body (as received, not re-serialised) with the webhook secret. */
+export const webhookSignatureOk = (cfg: BillingConfig, rawBody: string, signature: string) =>
+  Boolean(cfg.webhookSecret) && safeEqual(hmac(cfg.webhookSecret, rawBody), signature);
+
+// ---------------------------------------------------------------- purchase
+
+export type StartResult =
+  | {
+      ok: true;
+      free: false;
+      /** Hand these to Razorpay Checkout in the browser. */
+      checkout: {
+        key: string;
+        order_id: string;
+        amount: number;
+        currency: string;
+        name: string;
+        description: string;
+        prefill: { email: string };
+        notes: Record<string, string>;
+      };
+      quote: { list: string; discount: string; total: string };
+    }
+  | { ok: true; free: true; subscription: Subscription }
+  | { ok: false; error: string; problem?: CouponProblem };
+
+/** The plan and price as the pricing page shows them, for an optional coupon. */
+export async function quote(
+  store: BillingStore,
+  input: { user: BillingUser; planId: string; couponCode?: string },
+  now = new Date(),
+): Promise<{ ok: true; quote: Quote } | { ok: false; error: string; problem?: CouponProblem }> {
+  const plan = (await store.listPlans()).find((p) => p.id === input.planId && p.active);
+  if (!plan) return { ok: false, error: "Please pick a plan first." };
+  let coupon: Coupon | null = null;
+  if (input.couponCode?.trim()) {
+    const c = await checkCoupon(store, { code: input.couponCode, plan, user: input.user }, now);
+    if (!c.ok) return { ok: false, error: c.message, problem: c.problem };
+    coupon = c.coupon;
+  }
+  return { ok: true, quote: priceWith(plan, coupon) };
+}
+
+/**
+ * Start a purchase. A coupon that covers the whole price activates the plan at
+ * once with no Razorpay order (an admin's "free month for this person").
+ */
+export async function startPurchase(
+  store: BillingStore,
+  api: RazorpayApi,
+  cfg: BillingConfig,
+  input: { user: BillingUser; planId: string; couponCode?: string; appName: string },
+  now = new Date(),
+): Promise<StartResult> {
+  if (!cfg.enabled) return { ok: false, error: "Subscriptions aren't open yet." };
+  const q = await quote(store, input, now);
+  if (!q.ok) return q;
+  const { plan, coupon, listAmount, discount, amount } = q.quote;
+  const id = crypto.randomUUID();
+
+  if (amount === 0) {
+    const subscription = await store.transaction(async (tx) => {
+      const pay = await tx.insertPayment({
+        id,
+        userId: input.user.id,
+        planId: plan.id,
+        orderId: `free_${id}`,
+        paymentId: null,
+        listAmount,
+        discount,
+        amount: 0,
+        currency: plan.currency,
+        couponCode: coupon?.code ?? null,
+        status: "paid",
+        method: "coupon",
+        error: null,
+        subscriptionId: null,
+        paidAt: now,
+      });
+      const sub = await grantPeriod(
+        tx,
+        {
+          userId: input.user.id,
+          planId: plan.id,
+          days: plan.days,
+          source: "coupon",
+          amount: 0,
+          currency: plan.currency,
+          couponCode: coupon?.code ?? null,
+          note: `Coupon ${coupon?.code}`,
+        },
+        now,
+      );
+      await tx.updatePayment(pay.id, { subscriptionId: sub.id });
+      if (coupon)
+        await tx.insertRedemption({ couponCode: coupon.code, userId: input.user.id, paymentId: pay.id, discount, createdAt: now });
+      return sub;
+    });
+    return { ok: true, free: true, subscription };
+  }
+
+  if (!paymentsReady(cfg)) return { ok: false, error: "Online payment isn't open yet. Please write to us from the Help page." };
+  const notes: Record<string, string> = { app: cfg.appId, userId: input.user.id, planId: plan.id };
+  if (coupon) notes.coupon = coupon.code;
+  const order = await api.createOrder({
+    amount,
+    currency: plan.currency,
+    receipt: `${cfg.appId.slice(0, 12)}_${id.slice(0, 8)}_${now.getTime()}`.slice(0, 40),
+    notes,
+  });
+  await store.insertPayment({
+    id,
+    userId: input.user.id,
+    planId: plan.id,
+    orderId: order.id,
+    paymentId: null,
+    listAmount,
+    discount,
+    amount,
+    currency: plan.currency,
+    couponCode: coupon?.code ?? null,
+    status: "created",
+    method: null,
+    error: null,
+    subscriptionId: null,
+    paidAt: null,
+  });
+  return {
+    ok: true,
+    free: false,
+    checkout: {
+      key: cfg.keyId,
+      order_id: order.id,
+      amount,
+      currency: plan.currency,
+      name: input.appName,
+      description: `${plan.name} plan · ${plan.days} days`,
+      prefill: { email: input.user.email },
+      notes,
+    },
+    quote: {
+      list: formatMoney(listAmount, plan.currency),
+      discount: formatMoney(discount, plan.currency),
+      total: formatMoney(amount, plan.currency),
+    },
+  };
+}
+
+export type ActivateResult = { ok: true; already: boolean; subscription: Subscription | null } | { ok: false; error: string };
+
+/**
+ * Count a paid order exactly once, whoever gets here first (the verify route or
+ * the webhook): the conditional claim inside one transaction decides, and the
+ * loser sees `already`. The coupon is recorded as used here, when money moved,
+ * not when the order was made; if it ran out in between, the person still gets
+ * the price they paid (the row's note says so).
+ */
+export async function activate(
+  store: BillingStore,
+  input: { orderId: string; paymentId: string; payment?: RazorpayPayment | null },
+  now = new Date(),
+): Promise<ActivateResult> {
+  return store.transaction(async (tx) => {
+    const row = await tx.getPaymentByOrder(input.orderId);
+    if (!row) return { ok: false, error: "We don't recognise that order." };
+    if (row.status === "paid") return { ok: true, already: true, subscription: null };
+    if (input.payment?.amount !== undefined && Number(input.payment.amount) !== row.amount)
+      return { ok: false, error: `Amount mismatch: Razorpay says ${input.payment.amount}, the order was ${row.amount}.` };
+    const claimed = await tx.claimPayment(input.orderId, row.status === "failed" ? "failed" : "created", {
+      status: "paid",
+      paymentId: input.paymentId,
+      paidAt: now,
+      method: input.payment?.method ?? null,
+      error: null,
+    });
+    if (!claimed) return { ok: true, already: true, subscription: null };
+    const plans = await tx.listPlans();
+    const plan = plans.find((p) => p.id === row.planId);
+    let note = `Razorpay ${input.paymentId}`;
+    if (row.couponCode) {
+      const c = await tx.getCoupon(row.couponCode);
+      const total = await tx.countRedemptions(row.couponCode);
+      if (c?.maxRedemptions != null && total >= c.maxRedemptions) note += ` (coupon ${row.couponCode} ran out meanwhile; honoured)`;
+      await tx.insertRedemption({ couponCode: row.couponCode, userId: row.userId, paymentId: row.id, discount: row.discount, createdAt: now });
+    }
+    const sub = await grantPeriod(
+      tx,
+      {
+        userId: row.userId,
+        planId: row.planId,
+        days: plan?.days ?? 0,
+        source: "razorpay",
+        amount: row.amount,
+        currency: row.currency,
+        paymentRef: input.paymentId,
+        couponCode: row.couponCode,
+        note,
+      },
+      now,
+    );
+    await tx.updatePayment(row.id, { subscriptionId: sub.id });
+    return { ok: true, already: false, subscription: sub };
+  });
+}
+
+/** Checkout's success handler posts here (via the app's /api/billing/verify). */
+export async function verifyCheckout(
+  store: BillingStore,
+  api: RazorpayApi,
+  cfg: BillingConfig,
+  input: { userId: string; orderId: string; paymentId: string; signature: string },
+  now = new Date(),
+): Promise<ActivateResult> {
+  if (!input.orderId || !input.paymentId || !input.signature) return { ok: false, error: "The payment result is incomplete." };
+  const row = await store.getPaymentByOrder(input.orderId);
+  if (!row || row.userId !== input.userId) return { ok: false, error: "We don't recognise that order." };
+  if (!checkoutSignatureOk(cfg, input.orderId, input.paymentId, input.signature))
+    return { ok: false, error: "We couldn't verify this payment." };
+  if (row.status === "paid") return { ok: true, already: true, subscription: null };
+  let payment: RazorpayPayment | null = null;
+  try {
+    payment = await api.fetchPayment(input.paymentId);
+    // With automatic capture off, an authorised payment is refunded by the bank
+    // after a few days unless it is captured: capture it now.
+    if (payment.status === "authorized") payment = await api.capture(input.paymentId, row.amount, row.currency);
+  } catch {
+    payment = null; // the signature already proves the result; the webhook fills in the rest
+  }
+  if (payment?.status && payment.status !== "captured")
+    return { ok: false, error: `Razorpay reports this payment as ${payment.status}.` };
+  return activate(store, { orderId: input.orderId, paymentId: input.paymentId, payment }, now);
+}
+
+export type WebhookResult = { status: number; body: { ok: boolean; event?: string; ignored?: string; error?: string } };
+
+/**
+ * The webhook (raw body, header x-razorpay-signature). Handles
+ * payment.captured and order.paid (activate), payment.failed (record), and
+ * refund.processed (mark refunded; access is changed by the admin, not here).
+ * Answers 2xx for anything understood or ignored, so Razorpay stops retrying.
+ */
+export async function handleWebhook(
+  store: BillingStore,
+  cfg: BillingConfig,
+  rawBody: string,
+  signature: string,
+  now = new Date(),
+): Promise<WebhookResult> {
+  if (!webhookSignatureOk(cfg, rawBody, signature)) return { status: 400, body: { ok: false, error: "Bad signature." } };
+  let event: { event?: string; payload?: { payment?: { entity?: RazorpayPayment }; refund?: { entity?: { payment_id?: string } } } };
+  try {
+    event = JSON.parse(rawBody);
+  } catch {
+    return { status: 400, body: { ok: false, error: "Bad JSON." } };
+  }
+  const name = event.event ?? "unknown";
+  const p = event.payload?.payment?.entity;
+  if ((name === "payment.captured" || name === "order.paid") && p?.order_id) {
+    const r = await activate(store, { orderId: p.order_id, paymentId: p.id, payment: p }, now);
+    if (!r.ok) return { status: r.error.startsWith("We don't recognise") ? 200 : 409, body: { ok: false, event: name, error: r.error } };
+    return { status: 200, body: { ok: true, event: name } };
+  }
+  if (name === "payment.failed" && p?.order_id) {
+    // Never downgrade a paid order: a failed attempt can arrive after the retry that succeeded.
+    await store.claimPayment(p.order_id, "created", {
+      status: "failed",
+      error: String(p.error_description ?? p.error_reason ?? "failed").slice(0, 500),
+    });
+    return { status: 200, body: { ok: true, event: name } };
+  }
+  if (name === "refund.processed" && p?.order_id) {
+    await store.claimPayment(p.order_id, "paid", { status: "refunded" });
+    return { status: 200, body: { ok: true, event: name } };
+  }
+  return { status: 200, body: { ok: true, ignored: name } };
+}
+
+// ---------------------------------------------------------------- admin
+
+/** Admin: give days by hand (a bank transfer, an apology, an extended trial). */
+export const adminGrant = (store: BillingStore, userId: string, days: number, note: string, now = new Date()) =>
+  grantPeriod(store, { userId, planId: "admin", days, source: "admin", note }, now);
+
+/** Admin: end a period now (after a refund, or a grant made in error). Later periods move up. */
+export async function endPeriod(store: BillingStore, userId: string, subscriptionId: string, now = new Date()) {
+  const subs = (await store.listSubscriptions(userId)).sort((a, b) => a.startsAt.getTime() - b.startsAt.getTime());
+  const target = subs.find((s) => s.id === subscriptionId);
+  if (!target) throw new Error("No such period for this account.");
+  if (target.endsAt <= now) return target;
+  const cut = target.startsAt > now ? target.startsAt : now;
+  const removedMs = target.endsAt.getTime() - cut.getTime();
+  const ended = await store.updateSubscription(target.id, { endsAt: cut, note: `${target.note ?? ""} · ended early`.trim() });
+  for (const s of subs.filter((x) => x.startsAt >= target.endsAt))
+    await store.updateSubscription(s.id, {
+      startsAt: new Date(s.startsAt.getTime() - removedMs),
+      endsAt: new Date(s.endsAt.getTime() - removedMs),
+    });
+  return ended;
+}
+
+/** Admin: each coupon with how often it has been used. */
+export async function couponReport(store: BillingStore) {
+  const coupons = await store.listCoupons();
+  return Promise.all(coupons.map(async (c) => ({ ...c, used: await store.countRedemptions(c.code) })));
+}

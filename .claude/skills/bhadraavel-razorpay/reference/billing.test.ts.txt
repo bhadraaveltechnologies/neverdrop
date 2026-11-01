@@ -1,0 +1,270 @@
+// In the skill this is billing.test.ts.txt; scripts/test-references.sh in the
+// SkillFactory copies it out as billing.test.ts and runs it with `node --test`.
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import { test } from "node:test";
+import {
+  type BillingConfig,
+  type BillingUser,
+  type Plan,
+  type RazorpayApi,
+  type RazorpayPayment,
+  DAY_MS,
+  accessFor,
+  activate,
+  adminGrant,
+  checkCoupon,
+  createCoupon,
+  endPeriod,
+  ensureTrial,
+  formatMoney,
+  handleWebhook,
+  priceWith,
+  startPurchase,
+  verifyCheckout,
+} from "./billing.ts";
+import { memoryStore } from "./memory-store.ts";
+
+const NOW = new Date("2026-11-01T10:00:00Z");
+const later = (days: number) => new Date(NOW.getTime() + days * DAY_MS);
+
+const PLANS: Plan[] = [
+  { id: "monthly", name: "Monthly", days: 30, amount: 9900, currency: "INR", active: true, sort: 1 },
+  { id: "quarterly", name: "Quarterly", days: 90, amount: 24900, currency: "INR", active: true, sort: 2 },
+  { id: "yearly", name: "Yearly", days: 365, amount: 79900, currency: "INR", active: true, sort: 3 },
+  { id: "old", name: "Old", days: 30, amount: 4900, currency: "INR", active: false, sort: 9 },
+];
+const CFG: BillingConfig = {
+  enabled: true,
+  trialDays: 0,
+  appId: "testapp",
+  keyId: "rzp_test_key",
+  keySecret: "key_secret",
+  webhookSecret: "hook_secret",
+};
+const asha: BillingUser = { id: "u1", email: "asha@example.com", createdAt: NOW };
+const ravi: BillingUser = { id: "u2", email: "ravi@example.com", createdAt: NOW };
+
+function fakeApi(over: Partial<RazorpayApi> = {}): RazorpayApi & { orders: unknown[] } {
+  const orders: unknown[] = [];
+  return {
+    orders,
+    async createOrder(b) {
+      orders.push(b);
+      return { id: `order_${orders.length}`, amount: b.amount, currency: b.currency };
+    },
+    async fetchPayment(id) {
+      return { id, status: "captured", method: "upi" } as RazorpayPayment;
+    },
+    async capture(id) {
+      return { id, status: "captured" } as RazorpayPayment;
+    },
+    async refund(id) {
+      return { id: `rfnd_${id}`, status: "processed" };
+    },
+    ...over,
+  };
+}
+const sign = (secret: string, text: string) => crypto.createHmac("sha256", secret).update(text).digest("hex");
+const setup = () => memoryStore({ plans: structuredClone(PLANS) });
+
+test("money is formatted in rupees, whole amounts without paise", () => {
+  assert.equal(formatMoney(9900), "₹99");
+  assert.equal(formatMoney(123450), "₹1,234.50");
+  assert.equal(formatMoney(999, "USD"), "$9.99");
+});
+
+test("a percent coupon and an amount coupon price as expected", () => {
+  const plan = PLANS[2];
+  const pct = { kind: "percent", value: 25 } as never;
+  const amt = { kind: "amount", value: 20000, currency: "INR" } as never;
+  assert.deepEqual(
+    { d: priceWith(plan, pct).discount, a: priceWith(plan, pct).amount },
+    { d: 19975, a: 59925 },
+  );
+  assert.equal(priceWith(plan, amt).amount, 59900);
+  assert.equal(priceWith(plan, { kind: "percent", value: 100 } as never).amount, 0);
+  assert.equal(priceWith(plan, { kind: "amount", value: 999999, currency: "INR" } as never).amount, 0);
+});
+
+test("a price that would land under Razorpay's ₹1 minimum is rounded up to ₹1", () => {
+  const q = priceWith(PLANS[0], { kind: "amount", value: 9850, currency: "INR" } as never);
+  assert.equal(q.amount, 100);
+  assert.equal(q.discount, 9800);
+});
+
+test("coupon rules: dates, plans, account, first purchase, per person and total limits", async () => {
+  const s = setup();
+  await createCoupon(s, { code: "diwali25", kind: "percent", value: 25, validUntil: later(10) }, NOW);
+  await createCoupon(s, { code: "SOON", kind: "percent", value: 10, validFrom: later(5) }, NOW);
+  await createCoupon(s, { code: "YEARONLY", kind: "amount", value: 10000, currency: "INR", planIds: ["yearly"] }, NOW);
+  await createCoupon(s, { code: "FORASHA", kind: "percent", value: 100, email: "Asha@Example.com" }, NOW);
+  await createCoupon(s, { code: "ONE", kind: "percent", value: 10, maxRedemptions: 1 }, NOW);
+  await createCoupon(s, { code: "NEWBIE", kind: "percent", value: 50, firstPurchaseOnly: true }, NOW);
+  const m = PLANS[0];
+  const check = (code: string, user = asha, at = NOW, plan = m) => checkCoupon(s, { code, plan, user }, at);
+
+  assert.equal((await check(" diwali25 ")).ok, true, "case and spaces do not matter");
+  assert.equal((await check("DIWALI25", asha, later(11))) .ok, false);
+  assert.equal(((await check("DIWALI25", asha, later(11))) as { problem: string }).problem, "expired");
+  assert.equal(((await check("SOON")) as { problem: string }).problem, "not_yet");
+  assert.equal(((await check("YEARONLY")) as { problem: string }).problem, "plan");
+  assert.equal((await check("YEARONLY", asha, NOW, PLANS[2])).ok, true);
+  assert.equal(((await check("FORASHA", ravi)) as { problem: string }).problem, "account");
+  assert.equal((await check("FORASHA", asha)).ok, true);
+  assert.equal(((await check("NOPE")) as { problem: string }).problem, "unknown");
+  assert.equal(((await check("x")) as { problem: string }).problem, "format");
+
+  await s.insertRedemption({ couponCode: "ONE", userId: "u9", paymentId: "p", discount: 1, createdAt: NOW });
+  assert.equal(((await check("ONE")) as { problem: string }).problem, "exhausted");
+
+  await s.insertRedemption({ couponCode: "DIWALI25", userId: "u1", paymentId: "p", discount: 1, createdAt: NOW });
+  assert.equal(((await check("DIWALI25")) as { problem: string }).problem, "used");
+
+  await s.insertPayment({ id: "pp", userId: "u2", planId: "monthly", orderId: "o", paymentId: "x", listAmount: 9900, discount: 0, amount: 9900, currency: "INR", couponCode: null, status: "paid", method: "upi", error: null, subscriptionId: null, paidAt: NOW });
+  assert.equal(((await check("NEWBIE", ravi)) as { problem: string }).problem, "first_purchase");
+
+  await s.updateCoupon("DIWALI25", { active: false });
+  assert.equal(((await check("DIWALI25", ravi)) as { problem: string }).problem, "inactive");
+});
+
+test("an admin cannot make a broken coupon", async () => {
+  const s = setup();
+  await assert.rejects(createCoupon(s, { code: "BAD", kind: "percent", value: 150 }), /1 to 100/);
+  await assert.rejects(createCoupon(s, { code: "BAD", kind: "amount", value: 500 }), /currency/);
+  await assert.rejects(createCoupon(s, { code: "a b", kind: "percent", value: 5 }), /3 to 32/);
+  await assert.rejects(createCoupon(s, { code: "PLANX", kind: "percent", value: 5, planIds: ["gold"] }), /No such plan: gold/);
+  await createCoupon(s, { code: "TAKEN", kind: "percent", value: 5 });
+  await assert.rejects(createCoupon(s, { code: "taken", kind: "percent", value: 5 }), /already taken/);
+});
+
+test("with billing on, no subscription means no access; billing off lets everyone in; admins always pass", async () => {
+  const s = setup();
+  assert.equal((await accessFor(s, asha, { ...CFG, enabled: false }, NOW)).blocked, false);
+  const a = await accessFor(s, asha, CFG, NOW);
+  assert.deepEqual([a.status, a.blocked], ["none", true]);
+  assert.equal((await accessFor(s, { ...asha, isAdmin: true }, CFG, NOW)).blocked, false);
+  await adminGrant(s, asha.id, 30, "bank transfer", NOW);
+  const b = await accessFor(s, asha, CFG, NOW);
+  assert.deepEqual([b.status, b.blocked, b.daysLeft], ["active", false, 30]);
+  assert.equal((await accessFor(s, asha, CFG, later(31))).blocked, true, "blocked again once it ends");
+});
+
+test("the trial is a subscription row, granted once, never on top of a paid plan", async () => {
+  const s = setup();
+  const cfg = { ...CFG, trialDays: 14 };
+  const t = await ensureTrial(s, asha, cfg, NOW);
+  assert.equal(t?.source, "trial");
+  assert.equal(await ensureTrial(s, asha, cfg, later(20)), null, "only once");
+  assert.equal((await accessFor(s, asha, cfg, later(1))).status, "trial");
+  assert.equal((await accessFor(s, asha, cfg, later(15))).blocked, true);
+  await adminGrant(s, ravi.id, 30, "comp", NOW);
+  assert.equal(await ensureTrial(s, ravi, cfg, NOW), null, "already a customer");
+});
+
+test("a new plan stacks after everything already bought", async () => {
+  const s = setup();
+  await adminGrant(s, asha.id, 30, "first", NOW);
+  const second = await adminGrant(s, asha.id, 90, "second", later(10));
+  assert.equal(second.startsAt.getTime(), later(30).getTime());
+  const a = await accessFor(s, asha, CFG, later(10));
+  assert.equal(a.daysLeft, 110);
+});
+
+test("checkout: order priced on the server, verified by signature, counted once, coupon recorded", async () => {
+  const s = setup();
+  const api = fakeApi();
+  await createCoupon(s, { code: "TEN", kind: "percent", value: 10 }, NOW);
+  const r = await startPurchase(s, api, CFG, { user: asha, planId: "yearly", couponCode: "ten", appName: "Test App" }, NOW);
+  assert.ok(r.ok && !r.free);
+  if (!(r.ok && !r.free)) return;
+  assert.equal(r.checkout.amount, 71910);
+  assert.equal(r.quote.total, "₹719.10");
+  assert.equal(r.checkout.notes.coupon, "TEN");
+
+  const orderId = r.checkout.order_id;
+  const bad = await verifyCheckout(s, api, CFG, { userId: asha.id, orderId, paymentId: "pay_1", signature: "nope" }, NOW);
+  assert.equal(bad.ok, false);
+  const other = await verifyCheckout(s, api, CFG, { userId: ravi.id, orderId, paymentId: "pay_1", signature: sign("key_secret", `${orderId}|pay_1`) }, NOW);
+  assert.equal(other.ok, false, "someone else's order");
+
+  const good = await verifyCheckout(s, api, CFG, { userId: asha.id, orderId, paymentId: "pay_1", signature: sign("key_secret", `${orderId}|pay_1`) }, NOW);
+  assert.ok(good.ok && !good.already);
+  const again = await verifyCheckout(s, api, CFG, { userId: asha.id, orderId, paymentId: "pay_1", signature: sign("key_secret", `${orderId}|pay_1`) }, NOW);
+  assert.ok(again.ok && again.already);
+  assert.equal(s.state.subscriptions.length, 1);
+  assert.equal(s.state.redemptions.length, 1);
+  assert.equal((await accessFor(s, asha, CFG, NOW)).daysLeft, 365);
+});
+
+test("the verify route and the webhook arriving together grant one period, not two", async () => {
+  const s = setup();
+  const r = await startPurchase(s, fakeApi(), CFG, { user: asha, planId: "monthly", appName: "T" }, NOW);
+  assert.ok(r.ok && !r.free);
+  if (!(r.ok && !r.free)) return;
+  const orderId = r.checkout.order_id;
+  const body = JSON.stringify({ event: "payment.captured", payload: { payment: { entity: { id: "pay_9", order_id: orderId, amount: 9900, status: "captured" } } } });
+  const [a, b] = await Promise.all([
+    activate(s, { orderId, paymentId: "pay_9" }, NOW),
+    handleWebhook(s, CFG, body, sign("hook_secret", body), NOW),
+  ]);
+  assert.ok(a.ok);
+  assert.equal(b.status, 200);
+  assert.equal(s.state.subscriptions.length, 1);
+});
+
+test("webhook: bad signature refused, amount mismatch refused, failed then captured still activates, refund marked", async () => {
+  const s = setup();
+  const r = await startPurchase(s, fakeApi(), CFG, { user: asha, planId: "monthly", appName: "T" }, NOW);
+  if (!(r.ok && !r.free)) throw new Error("no order");
+  const orderId = r.checkout.order_id;
+  const send = (o: unknown) => {
+    const raw = JSON.stringify(o);
+    return handleWebhook(s, CFG, raw, sign("hook_secret", raw), NOW);
+  };
+  assert.equal((await handleWebhook(s, CFG, "{}", "bad", NOW)).status, 400);
+  assert.equal((await send({ event: "payment.captured", payload: { payment: { entity: { id: "p1", order_id: orderId, amount: 1 } } } })).status, 409);
+  await send({ event: "payment.failed", payload: { payment: { entity: { id: "p1", order_id: orderId, error_description: "Bank declined" } } } });
+  assert.equal(s.state.payments[0].status, "failed");
+  assert.equal((await accessFor(s, asha, CFG, NOW)).blocked, true);
+  await send({ event: "payment.captured", payload: { payment: { entity: { id: "p2", order_id: orderId, amount: 9900 } } } });
+  assert.equal(s.state.payments[0].status, "paid");
+  await send({ event: "payment.failed", payload: { payment: { entity: { id: "p3", order_id: orderId } } } });
+  assert.equal(s.state.payments[0].status, "paid", "a late failure never downgrades a paid order");
+  await send({ event: "refund.processed", payload: { payment: { entity: { id: "p2", order_id: orderId } } } });
+  assert.equal(s.state.payments[0].status, "refunded");
+  assert.equal((await send({ event: "subscription.charged", payload: {} })).body.ignored, "subscription.charged");
+});
+
+test("a 100% coupon activates at once with no Razorpay order", async () => {
+  const s = setup();
+  const api = fakeApi();
+  await createCoupon(s, { code: "GIFT-ASHA", kind: "percent", value: 100, email: "asha@example.com", planIds: ["quarterly"] }, NOW);
+  const r = await startPurchase(s, api, { ...CFG, keyId: "", keySecret: "" }, { user: asha, planId: "quarterly", couponCode: "gift-asha", appName: "T" }, NOW);
+  assert.ok(r.ok && r.free);
+  assert.equal(api.orders.length, 0);
+  assert.equal((await accessFor(s, asha, CFG, NOW)).daysLeft, 90);
+  const again = await startPurchase(s, api, CFG, { user: asha, planId: "quarterly", couponCode: "GIFT-ASHA", appName: "T" }, NOW);
+  assert.equal(again.ok, false, "used once already");
+});
+
+test("inactive plans and closed billing are refused", async () => {
+  const s = setup();
+  const off = await startPurchase(s, fakeApi(), { ...CFG, enabled: false }, { user: asha, planId: "monthly", appName: "T" }, NOW);
+  assert.equal(off.ok, false);
+  const old = await startPurchase(s, fakeApi(), CFG, { user: asha, planId: "old", appName: "T" }, NOW);
+  assert.equal(old.ok, false);
+  const noKeys = await startPurchase(s, fakeApi(), { ...CFG, keySecret: "" }, { user: asha, planId: "monthly", appName: "T" }, NOW);
+  assert.equal(noKeys.ok, false);
+});
+
+test("ending a period early moves the later ones up", async () => {
+  const s = setup();
+  const first = await adminGrant(s, asha.id, 30, "a", NOW);
+  const second = await adminGrant(s, asha.id, 30, "b", NOW);
+  await endPeriod(s, asha.id, first.id, later(10));
+  const subs = await s.listSubscriptions(asha.id);
+  const moved = subs.find((x) => x.id === second.id);
+  assert.equal(moved?.startsAt.getTime(), later(10).getTime());
+  assert.equal((await accessFor(s, asha, CFG, later(10))).daysLeft, 30);
+});
