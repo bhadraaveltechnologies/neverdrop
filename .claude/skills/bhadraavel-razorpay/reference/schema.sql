@@ -2,7 +2,8 @@
 -- constraints to the app's ORM (Drizzle, Prisma) or database as they are: the
 -- constraints are what keep money counted once. `users(id)` is the app's own
 -- account table; change the reference if it is called something else.
--- Amounts are integers in the smallest unit (paise / cents), taxes included.
+-- Amounts are integers in the smallest unit (paise / cents). Plan prices are
+-- before GST; GST_PERCENT is added at checkout (0 = prices are final).
 
 -- The plans on sale. Admin-managed (seeded once, then changed from the admin
 -- screen or API); a plan is retired with active = false, never deleted, so
@@ -12,7 +13,7 @@ CREATE TABLE billing_plans (
   name        text NOT NULL,                   -- 'Monthly'
   description text,                            -- one line under the price
   days        integer NOT NULL CHECK (days > 0),
-  amount      integer NOT NULL CHECK (amount >= 100),
+  amount      integer NOT NULL CHECK (amount >= 100), -- before GST
   currency    text NOT NULL DEFAULT 'INR',
   active      boolean NOT NULL DEFAULT true,
   sort        integer NOT NULL DEFAULT 0
@@ -52,7 +53,8 @@ CREATE TABLE payments (
   payment_id      text,
   list_amount     integer NOT NULL,
   discount        integer NOT NULL DEFAULT 0,
-  amount          integer NOT NULL,            -- what was charged
+  tax             integer NOT NULL DEFAULT 0,  -- GST on (list_amount - discount)
+  amount          integer NOT NULL,            -- what was charged: list - discount + tax
   currency        text NOT NULL DEFAULT 'INR',
   coupon_code     text,
   status          text NOT NULL DEFAULT 'created' CHECK (status IN ('created', 'paid', 'failed', 'refunded')),
@@ -96,7 +98,17 @@ CREATE TABLE coupon_redemptions (
 );
 CREATE INDEX coupon_redemptions_code_idx ON coupon_redemptions (coupon_code, user_id);
 
--- Seed: the plans to start with (change names and prices to the app's).
+-- Every admin action on billing (plans, coupons, grants, ended periods,
+-- refunds): who, what, when. Written by the admin API and the admin screen.
+CREATE TABLE billing_admin_log (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  actor      text NOT NULL,                    -- the admin's email, or 'admin-api'
+  action     text NOT NULL,                    -- plan | coupon-create | coupon-change | grant | end-period | refund
+  detail     jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Seed: the plans to start with, before GST (ask the user for theirs).
 INSERT INTO billing_plans (id, name, description, days, amount, currency, sort) VALUES
   ('monthly',   'Monthly',   'Pay as you go.',                 30,  9900, 'INR', 1),
   ('quarterly', 'Quarterly', 'Three months, a little less.',   90, 24900, 'INR', 2),

@@ -24,8 +24,9 @@ Placeholders: `{App}` the app's name, `{plan}` a plan's name, `{days}`,
 - Lead, billing off: *{App} is free to use at the moment. When plans open,
   these are the ones, and you will see everything here before anything is
   charged.*
-- Plan card: **{plan}** · **{price}** · *{days} days* · the plan's one-line
-  description · button **Choose {plan}**. The longest plan may carry a quiet
+- Plan card: **{plan}** · **{price}** (followed by a small *+ GST* when
+  `GST_PERCENT` is set) · *{days} days* · the plan's one-line description ·
+  button **Choose {plan}**. The longest plan may carry a quiet
   tag *Best value* (only when it really is the cheapest per day).
 - Price note under the cards: *Prices are in rupees and include all taxes.*
   (or *Prices are in rupees; GST is added at checkout where it applies.* when
@@ -35,6 +36,19 @@ Placeholders: `{App}` the app's name, `{plan}` a plan's name, `{days}`,
 - Trust line: *We never see or keep your card or bank details.*
 - Signed out: button **Sign in to subscribe** (to sign-in, then back here).
 - Questions line: *Questions? See the FAQ below, or reach us through Help.*
+
+## Summary before paying
+
+Choosing a plan opens its summary under the cards, priced by the server:
+
+- Heading: **{plan} plan**
+- Lines: *{plan} · {days} days* … {list} · *Coupon {code}* … − {discount}
+  (only with a coupon) · *GST {rate}%* … {tax} (only when GST is added) ·
+  rule · **You pay** … **{total}**
+- While pricing: *Working out the price…*
+- Button: **Pay {total}**, or **Start {plan}** when a coupon covers it all;
+  *Opening payment…* while the order is made.
+- The coupon link sits between the lines and the button.
 
 ## Coupon field
 
@@ -132,6 +146,14 @@ hidden (Google's policy on digital goods). In their place:
 
 ## Admin screens
 
+- Status line: *Billing is {on | off (BILLING_ENABLED)} · payments {on |
+  off: RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET are not set on the server} ·
+  {webhook secret set | the webhook secret is not set: payments still count
+  through the browser, but a closed tab could miss one} · GST {rate}% · trial
+  {days} days*
+- Plans heading note: *Prices before GST, in rupees. Retire a plan by
+  unticking Active; never delete one.*
+- Plan saved: *Saved the {plan} plan.*
 - Coupon created: *Coupon {code} is ready: {25% | ₹100} off{ on {plans}}{,
   for {email} only}{, until {date}}. Share the code with the person.*
 - Coupon switched off: *Coupon {code} is switched off. Codes already used
@@ -143,6 +165,10 @@ hidden (Google's policy on digital goods). In their place:
 - Refund issued: *Refund of {total} sent to Razorpay for {ref}. It reaches
   the customer in 5–7 working days. Decide separately whether to end their
   period.*
+- Refund refused by Razorpay: *Razorpay: {its reason}. Nothing was refunded.*
+- Razorpay unreachable: *Razorpay didn't answer ({error}). Nothing was
+  refunded; please try again in a minute.*
+- Coupon switched back on: *Coupon {code} is on again.*
 - Payments not configured: *Online payment is off: RAZORPAY_KEY_ID and
   RAZORPAY_KEY_SECRET are not set on the server.*
 - Webhook not configured: *The webhook secret is not set: payments still

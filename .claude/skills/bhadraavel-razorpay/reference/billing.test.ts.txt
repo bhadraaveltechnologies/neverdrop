@@ -19,7 +19,9 @@ import {
   ensureTrial,
   formatMoney,
   handleWebhook,
+  isAdmin,
   priceWith,
+  quote,
   startPurchase,
   verifyCheckout,
 } from "./billing.ts";
@@ -41,6 +43,7 @@ const CFG: BillingConfig = {
   keyId: "rzp_test_key",
   keySecret: "key_secret",
   webhookSecret: "hook_secret",
+  taxPercent: 0,
 };
 const asha: BillingUser = { id: "u1", email: "asha@example.com", createdAt: NOW };
 const ravi: BillingUser = { id: "u2", email: "ravi@example.com", createdAt: NOW };
@@ -121,7 +124,7 @@ test("coupon rules: dates, plans, account, first purchase, per person and total 
   await s.insertRedemption({ couponCode: "DIWALI25", userId: "u1", paymentId: "p", discount: 1, createdAt: NOW });
   assert.equal(((await check("DIWALI25")) as { problem: string }).problem, "used");
 
-  await s.insertPayment({ id: "pp", userId: "u2", planId: "monthly", orderId: "o", paymentId: "x", listAmount: 9900, discount: 0, amount: 9900, currency: "INR", couponCode: null, status: "paid", method: "upi", error: null, subscriptionId: null, paidAt: NOW });
+  await s.insertPayment({ id: "pp", userId: "u2", planId: "monthly", orderId: "o", paymentId: "x", listAmount: 9900, discount: 0, tax: 0, amount: 9900, currency: "INR", couponCode: null, status: "paid", method: "upi", error: null, subscriptionId: null, paidAt: NOW });
   assert.equal(((await check("NEWBIE", ravi)) as { problem: string }).problem, "first_purchase");
 
   await s.updateCoupon("DIWALI25", { active: false });
@@ -268,3 +271,37 @@ test("ending a period early moves the later ones up", async () => {
   assert.equal(moved?.startsAt.getTime(), later(10).getTime());
   assert.equal((await accessFor(s, asha, CFG, later(10))).daysLeft, 30);
 });
+
+test("GST is added after the discount, charged with the order and stored on it", async () => {
+  const plan = PLANS[0]; // ₹99
+  const q = priceWith(plan, null, 18);
+  assert.deepEqual([q.net, q.tax, q.amount], [9900, 1782, 11682]);
+  const tenOff = priceWith(PLANS[2], { kind: "percent", value: 10 } as never, 18);
+  assert.deepEqual([tenOff.discount, tenOff.net, tenOff.tax, tenOff.amount], [7990, 71910, 12944, 84854]);
+  assert.equal(priceWith(plan, { kind: "percent", value: 100 } as never, 18).amount, 0, "a free plan has no GST");
+  // under ₹1 with GST: the total becomes ₹1, GST inside it
+  const tiny = priceWith(plan, { kind: "amount", value: 9850, currency: "INR" } as never, 18);
+  assert.deepEqual([tiny.amount, tiny.tax, tiny.net], [100, 15, 85]);
+  assert.equal(priceWith(plan, null, 0).tax, 0, "GST_PERCENT 0: prices are final");
+
+  const s = setup();
+  const r = await startPurchase(s, fakeApi(), { ...CFG, taxPercent: 18 }, { user: asha, planId: "monthly", appName: "T" }, NOW);
+  assert.ok(r.ok && !r.free);
+  if (!(r.ok && !r.free)) return;
+  assert.equal(r.checkout.amount, 11682, "Razorpay is asked for the total");
+  assert.deepEqual(r.quote, { list: "₹99", discount: "₹0", tax: "₹17.82", total: "₹116.82" });
+  const [row] = s.state.payments;
+  assert.deepEqual([row.listAmount, row.discount, row.tax, row.amount], [9900, 0, 1782, 11682]);
+  const q2 = await quote(s, { user: asha, planId: "monthly" }, NOW, 18);
+  assert.ok(q2.ok && q2.quote.amount === 11682, "the quote route prices the same way");
+});
+
+test("admins come from ADMIN_EMAILS, case and spaces aside", () => {
+  const env = { ADMIN_EMAILS: " Owner@Example.com , ops@example.com" };
+  assert.equal(isAdmin("owner@example.com", env), true);
+  assert.equal(isAdmin("OPS@example.com ", env), true);
+  assert.equal(isAdmin("asha@example.com", env), false);
+  assert.equal(isAdmin(null, env), false);
+  assert.equal(isAdmin("owner@example.com", {}), false);
+});
+
