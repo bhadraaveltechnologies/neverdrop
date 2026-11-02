@@ -1,0 +1,121 @@
+/**
+ * An in-memory BillingStore: what the tests run on, and a readable template
+ * for porting the store to a real database. Each method says the SQL it
+ * stands for (tables in schema.sql). Transactions run one at a time and roll
+ * back on a throw, like BEGIN … COMMIT / ROLLBACK.
+ */
+import crypto from "node:crypto";
+import type { BillingStore, Coupon, Payment, PaymentStatus, Plan, Redemption, Subscription } from "./billing.ts";
+
+type State = {
+  plans: Plan[];
+  coupons: Coupon[];
+  redemptions: Redemption[];
+  subscriptions: Subscription[];
+  payments: Payment[];
+};
+
+const clone = (s: State): State => structuredClone(s);
+
+export function memoryStore(seed: Partial<State> = {}): BillingStore & { state: State } {
+  const box: { state: State } = {
+    state: { plans: [], coupons: [], redemptions: [], subscriptions: [], payments: [], ...seed },
+  };
+  let queue: Promise<unknown> = Promise.resolve();
+
+  const store: BillingStore & { state: State } = {
+    get state() {
+      return box.state;
+    },
+    // BEGIN; …; COMMIT (ROLLBACK on error). Serialised, as row locks would.
+    transaction<T>(fn: (tx: BillingStore) => Promise<T>): Promise<T> {
+      const run = queue.then(async () => {
+        const before = clone(box.state);
+        try {
+          return await fn(store);
+        } catch (e) {
+          box.state = before;
+          throw e;
+        }
+      });
+      queue = run.catch(() => undefined);
+      return run;
+    },
+    // SELECT * FROM billing_plans ORDER BY sort
+    async listPlans() {
+      return [...box.state.plans].sort((a, b) => a.sort - b.sort);
+    },
+    // INSERT … ON CONFLICT (id) DO UPDATE
+    async upsertPlan(plan) {
+      box.state.plans = [...box.state.plans.filter((p) => p.id !== plan.id), plan];
+      return plan;
+    },
+    // SELECT * FROM coupons WHERE code = $1
+    async getCoupon(code) {
+      return box.state.coupons.find((c) => c.code === code) ?? null;
+    },
+    async insertCoupon(c) {
+      if (box.state.coupons.some((x) => x.code === c.code)) throw new Error("duplicate code");
+      box.state.coupons.push(c);
+      return c;
+    },
+    async updateCoupon(code, patch) {
+      const c = box.state.coupons.find((x) => x.code === code);
+      if (!c) return null;
+      Object.assign(c, patch, { code });
+      return c;
+    },
+    async listCoupons() {
+      return [...box.state.coupons].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    },
+    // SELECT count(*) FROM coupon_redemptions WHERE code = $1 [AND user_id = $2]
+    async countRedemptions(code, userId) {
+      return box.state.redemptions.filter((r) => r.couponCode === code && (!userId || r.userId === userId)).length;
+    },
+    async insertRedemption(r) {
+      box.state.redemptions.push(r);
+    },
+    // SELECT * FROM subscriptions WHERE user_id = $1
+    async listSubscriptions(userId) {
+      return box.state.subscriptions.filter((s) => s.userId === userId);
+    },
+    async insertSubscription(s) {
+      const row: Subscription = { ...s, id: crypto.randomUUID(), createdAt: new Date() };
+      box.state.subscriptions.push(row);
+      return row;
+    },
+    async updateSubscription(id, patch) {
+      const s = box.state.subscriptions.find((x) => x.id === id);
+      if (!s) return null;
+      Object.assign(s, patch, { id });
+      return s;
+    },
+    // SELECT count(*) FROM payments WHERE user_id = $1 AND status = 'paid' AND amount > 0
+    async countPaidPayments(userId) {
+      return box.state.payments.filter((p) => p.userId === userId && p.status === "paid" && p.amount > 0).length;
+    },
+    async insertPayment(p) {
+      if (box.state.payments.some((x) => x.orderId === p.orderId)) throw new Error("duplicate order");
+      const row: Payment = { ...p, createdAt: new Date() };
+      box.state.payments.push(row);
+      return row;
+    },
+    async getPaymentByOrder(orderId) {
+      return box.state.payments.find((p) => p.orderId === orderId) ?? null;
+    },
+    // UPDATE payments SET … WHERE order_id = $1 AND status = $2 RETURNING *
+    async claimPayment(orderId, from: PaymentStatus, patch) {
+      const p = box.state.payments.find((x) => x.orderId === orderId && x.status === from);
+      if (!p) return null;
+      Object.assign(p, patch);
+      return p;
+    },
+    async updatePayment(id, patch) {
+      const p = box.state.payments.find((x) => x.id === id);
+      if (!p) return null;
+      Object.assign(p, patch, { id });
+      return p;
+    },
+  };
+  return store;
+}
