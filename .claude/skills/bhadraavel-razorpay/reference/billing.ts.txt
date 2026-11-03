@@ -1,6 +1,6 @@
 /**
- * Reference billing core for a Bhadraavel app: plans, coupons, Razorpay
- * orders, verification, the webhook, and the access rule.
+ * Reference billing core for a Bhadraavel app: plans, coupons, GST, Razorpay
+ * orders, verification, the webhook, the access rule and the admin check.
  *
  * Framework- and database-free on purpose: everything it reads or writes goes
  * through `BillingStore` (see schema.sql for the tables and
@@ -13,8 +13,13 @@
  * billing.ts. The SkillFactory's scripts/test-references.sh runs its tests.
  *
  * Money is always an integer in the currency's smallest unit (paise for INR,
- * cents for USD). Nothing here trusts a price, a discount or an amount sent by
- * the browser: the server prices every order itself.
+ * cents for USD). Plan prices are before GST; GST_PERCENT (0 = none, prices
+ * final) is added after any discount: list − discount = net, + tax = what
+ * Razorpay charges. Nothing here trusts a price, a discount or an amount sent
+ * by the browser: the server prices every order itself.
+ *
+ * First used in Memorize It (lib/billing/core.ts), where it is tested against
+ * a Drizzle store on Postgres.
  */
 import crypto from "node:crypto";
 
@@ -25,7 +30,7 @@ export type Plan = {
   name: string;
   description?: string;
   days: number;
-  amount: number; // smallest unit, taxes included
+  amount: number; // smallest unit, before GST (added at checkout when GST_PERCENT is set)
   currency: string; // "INR"
   active: boolean;
   sort: number;
@@ -82,6 +87,9 @@ export type Payment = {
   paymentId: string | null;
   listAmount: number;
   discount: number;
+  /** GST on (list − discount). */
+  tax: number;
+  /** What was charged: list − discount + tax. */
   amount: number;
   currency: string;
   couponCode: string | null;
@@ -127,7 +135,11 @@ export interface BillingStore {
   insertPayment(p: Omit<Payment, "createdAt">): Promise<Payment>;
   getPaymentByOrder(orderId: string): Promise<Payment | null>;
   /** UPDATE payments SET … WHERE order_id = $1 AND status = $2 RETURNING *. */
-  claimPayment(orderId: string, from: PaymentStatus, patch: Partial<Payment>): Promise<Payment | null>;
+  claimPayment(
+    orderId: string,
+    from: PaymentStatus,
+    patch: Partial<Payment>,
+  ): Promise<Payment | null>;
   updatePayment(id: string, patch: Partial<Payment>): Promise<Payment | null>;
 }
 
@@ -140,13 +152,18 @@ export type BillingConfig = {
   keyId: string; // RAZORPAY_KEY_ID (public, sent to the browser)
   keySecret: string; // RAZORPAY_KEY_SECRET (server only)
   webhookSecret: string; // RAZORPAY_WEBHOOK_SECRET (server only)
+  /** GST_PERCENT: added on top of the (discounted) price at checkout; 0 = none. */
+  taxPercent: number;
 };
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
 /** Razorpay will not take an order below 100 of the smallest unit (₹1 / $1). */
 export const MIN_ORDER = 100;
 
-export function configFromEnv(env: Record<string, string | undefined>, appId: string): BillingConfig {
+export function configFromEnv(
+  env: Record<string, string | undefined>,
+  appId: string,
+): BillingConfig {
   const trial = Number(env.TRIAL_DAYS ?? "0");
   return {
     enabled: env.BILLING_ENABLED === "true",
@@ -155,6 +172,10 @@ export function configFromEnv(env: Record<string, string | undefined>, appId: st
     keyId: (env.RAZORPAY_KEY_ID ?? "").trim(),
     keySecret: (env.RAZORPAY_KEY_SECRET ?? "").trim(),
     webhookSecret: (env.RAZORPAY_WEBHOOK_SECRET ?? "").trim(),
+    taxPercent: (() => {
+      const n = Number(env.GST_PERCENT ?? "0");
+      return Number.isFinite(n) && n > 0 && n <= 50 ? n : 0;
+    })(),
   };
 }
 
@@ -162,7 +183,14 @@ export const paymentsReady = (cfg: BillingConfig) => Boolean(cfg.keyId && cfg.ke
 
 // ---------------------------------------------------------------- money
 
-const SYMBOL: Record<string, string> = { INR: "₹", USD: "$", EUR: "€", GBP: "£", SGD: "S$", AED: "AED " };
+const SYMBOL: Record<string, string> = {
+  INR: "₹",
+  USD: "$",
+  EUR: "€",
+  GBP: "£",
+  SGD: "S$",
+  AED: "AED ",
+};
 
 /** "₹49", "₹1,234.50", "$9.99": whole amounts stay whole. */
 export function formatMoney(amount: number, currency = "INR"): string {
@@ -213,23 +241,35 @@ export type Quote = {
   coupon: Coupon | null;
   listAmount: number;
   discount: number;
+  /** list − discount: the price before GST. */
+  net: number;
+  tax: number;
+  taxPercent: number;
+  /** What is charged: net + tax. */
   amount: number;
 };
 
-/** Price a plan with an (already checked) coupon. The result is never below MIN_ORDER unless it is 0. */
-export function priceWith(plan: Plan, coupon: Coupon | null): Quote {
+/**
+ * Price a plan with an (already checked) coupon, then add GST on what is
+ * left. The total is never below MIN_ORDER unless it is 0 (a coupon that
+ * covers the whole price): a smaller one is rounded up to it.
+ */
+export function priceWith(plan: Plan, coupon: Coupon | null, taxPercent = 0): Quote {
   const list = plan.amount;
   let discount = 0;
   if (coupon?.kind === "percent") discount = Math.round((list * coupon.value) / 100);
   if (coupon?.kind === "amount") discount = coupon.value;
   discount = Math.min(Math.max(discount, 0), list);
-  let amount = list - discount;
-  if (amount > 0 && amount < MIN_ORDER) {
-    // A charge Razorpay would refuse: round the price up to its minimum.
-    amount = Math.min(MIN_ORDER, list);
-    discount = list - amount;
+  let net = list - discount;
+  let tax = Math.round((net * taxPercent) / 100);
+  if (net > 0 && net + tax < MIN_ORDER) {
+    // A charge Razorpay would refuse: the total becomes its minimum, GST inside it.
+    const total = MIN_ORDER;
+    tax = Math.round((total * taxPercent) / (100 + taxPercent));
+    net = total - tax;
+    discount = Math.max(0, list - net);
   }
-  return { plan, coupon, listAmount: list, discount, amount };
+  return { plan, coupon, listAmount: list, discount, net, tax, taxPercent, amount: net + tax };
 }
 
 /** Is this code good for this person and plan right now? */
@@ -238,7 +278,11 @@ export async function checkCoupon(
   input: { code: string; plan: Plan; user: BillingUser },
   now = new Date(),
 ): Promise<{ ok: true; coupon: Coupon } | { ok: false; problem: CouponProblem; message: string }> {
-  const fail = (problem: CouponProblem) => ({ ok: false as const, problem, message: COUPON_MESSAGES[problem] });
+  const fail = (problem: CouponProblem) => ({
+    ok: false as const,
+    problem,
+    message: COUPON_MESSAGES[problem],
+  });
   const code = normalizeCode(input.code);
   if (!CODE_RE.test(code)) return fail("format");
   const c = await store.getCoupon(code);
@@ -247,9 +291,11 @@ export async function checkCoupon(
   if (c.validFrom && now < c.validFrom) return fail("not_yet");
   if (c.validUntil && now > c.validUntil) return fail("expired");
   if (c.planIds && !c.planIds.includes(input.plan.id)) return fail("plan");
-  if (c.kind === "amount" && c.currency && c.currency !== input.plan.currency) return fail("currency");
+  if (c.kind === "amount" && c.currency && c.currency !== input.plan.currency)
+    return fail("currency");
   if (c.email && c.email.toLowerCase() !== input.user.email.toLowerCase()) return fail("account");
-  if (c.firstPurchaseOnly && (await store.countPaidPayments(input.user.id)) > 0) return fail("first_purchase");
+  if (c.firstPurchaseOnly && (await store.countPaidPayments(input.user.id)) > 0)
+    return fail("first_purchase");
   if ((await store.countRedemptions(code, input.user.id)) >= c.perUserLimit) return fail("used");
   if (c.maxRedemptions !== null && (await store.countRedemptions(code)) >= c.maxRedemptions)
     return fail("exhausted");
@@ -272,11 +318,21 @@ export type NewCoupon = {
 };
 
 /** Admin: make a coupon. Throws a sentence the admin screen can show as is. */
-export async function createCoupon(store: BillingStore, input: NewCoupon, now = new Date()): Promise<Coupon> {
+export async function createCoupon(
+  store: BillingStore,
+  input: NewCoupon,
+  now = new Date(),
+): Promise<Coupon> {
   const code = normalizeCode(input.code);
-  if (!CODE_RE.test(code)) throw new Error("A code is 3 to 32 letters, digits or dashes, starting with a letter or digit.");
+  if (!CODE_RE.test(code))
+    throw new Error(
+      "A code is 3 to 32 letters, digits or dashes, starting with a letter or digit.",
+    );
   if (await store.getCoupon(code)) throw new Error(`The code ${code} is already taken.`);
-  if (input.kind === "percent" && !(Number.isInteger(input.value) && input.value >= 1 && input.value <= 100))
+  if (
+    input.kind === "percent" &&
+    !(Number.isInteger(input.value) && input.value >= 1 && input.value <= 100)
+  )
     throw new Error("A percent discount is a whole number from 1 to 100.");
   if (input.kind === "amount") {
     if (!(Number.isInteger(input.value) && input.value > 0))
@@ -284,8 +340,12 @@ export async function createCoupon(store: BillingStore, input: NewCoupon, now = 
     if (!input.currency) throw new Error("An amount discount needs its currency, e.g. INR.");
   }
   const perUser = input.perUserLimit ?? 1;
-  if (!(Number.isInteger(perUser) && perUser >= 1)) throw new Error("Uses per account is a whole number, 1 or more.");
-  if (input.maxRedemptions != null && !(Number.isInteger(input.maxRedemptions) && input.maxRedemptions >= 1))
+  if (!(Number.isInteger(perUser) && perUser >= 1))
+    throw new Error("Uses per account is a whole number, 1 or more.");
+  if (
+    input.maxRedemptions != null &&
+    !(Number.isInteger(input.maxRedemptions) && input.maxRedemptions >= 1)
+  )
     throw new Error("Total uses is a whole number, 1 or more (or empty for no limit).");
   if (input.validFrom && input.validUntil && input.validUntil <= input.validFrom)
     throw new Error("The end date must be after the start date.");
@@ -325,7 +385,8 @@ export type Access = {
   daysLeft: number | null;
 };
 
-const daysBetween = (end: Date, now: Date) => Math.max(0, Math.ceil((end.getTime() - now.getTime()) / DAY_MS));
+const daysBetween = (end: Date, now: Date) =>
+  Math.max(0, Math.ceil((end.getTime() - now.getTime()) / DAY_MS));
 
 /**
  * The rule: with billing on, a person may use the app only while a
@@ -339,12 +400,16 @@ export async function accessFor(
   cfg: BillingConfig,
   now = new Date(),
 ): Promise<Access> {
-  if (!cfg.enabled) return { status: "off", blocked: false, current: null, paidUntil: null, daysLeft: null };
+  if (!cfg.enabled)
+    return { status: "off", blocked: false, current: null, paidUntil: null, daysLeft: null };
   const subs = await store.listSubscriptions(user.id);
   const current = subs.find((s) => s.startsAt <= now && s.endsAt > now) ?? null;
   const future = subs.filter((s) => s.endsAt > now);
-  const paidUntil = future.length ? new Date(Math.max(...future.map((s) => s.endsAt.getTime()))) : null;
-  if (!current) return { status: "none", blocked: !user.isAdmin, current: null, paidUntil, daysLeft: 0 };
+  const paidUntil = future.length
+    ? new Date(Math.max(...future.map((s) => s.endsAt.getTime())))
+    : null;
+  if (!current)
+    return { status: "none", blocked: !user.isAdmin, current: null, paidUntil, daysLeft: 0 };
   return {
     status: current.source === "trial" ? "trial" : "active",
     blocked: false,
@@ -370,7 +435,8 @@ export async function grantPeriod(
   },
   now = new Date(),
 ): Promise<Subscription> {
-  if (!(Number.isInteger(g.days) && g.days > 0)) throw new Error("Days must be a whole number above zero.");
+  if (!(Number.isInteger(g.days) && g.days > 0))
+    throw new Error("Days must be a whole number above zero.");
   const subs = await store.listSubscriptions(g.userId);
   const lastEnd = subs.reduce((m, s) => (s.endsAt > m ? s.endsAt : m), now);
   const startsAt = lastEnd > now ? lastEnd : now;
@@ -434,7 +500,11 @@ export type RazorpayApi = {
   }): Promise<{ id: string; amount: number; currency: string }>;
   fetchPayment(paymentId: string): Promise<RazorpayPayment>;
   capture(paymentId: string, amount: number, currency: string): Promise<RazorpayPayment>;
-  refund(paymentId: string, amount?: number, notes?: Record<string, string>): Promise<{ id: string; status: string }>;
+  refund(
+    paymentId: string,
+    amount?: number,
+    notes?: Record<string, string>,
+  ): Promise<{ id: string; status: string }>;
 };
 
 /** Razorpay's REST API with fetch and Basic auth: no SDK needed. */
@@ -448,19 +518,29 @@ export function razorpayApi(cfg: BillingConfig, fetchImpl: typeof fetch = fetch)
       signal: AbortSignal.timeout(15_000),
     });
     const data = (await res.json().catch(() => ({}))) as { error?: { description?: string } };
-    if (!res.ok) throw new Error(data.error?.description ? `Razorpay: ${data.error.description}` : `Razorpay responded ${res.status}`);
+    if (!res.ok)
+      throw new Error(
+        data.error?.description
+          ? `Razorpay: ${data.error.description}`
+          : `Razorpay responded ${res.status}`,
+      );
     return data as T;
   }
   return {
     createOrder: (b) => call("/orders", "POST", b),
     fetchPayment: (id) => call(`/payments/${encodeURIComponent(id)}`),
-    capture: (id, amount, currency) => call(`/payments/${encodeURIComponent(id)}/capture`, "POST", { amount, currency }),
+    capture: (id, amount, currency) =>
+      call(`/payments/${encodeURIComponent(id)}/capture`, "POST", { amount, currency }),
     refund: (id, amount, notes) =>
-      call(`/payments/${encodeURIComponent(id)}/refund`, "POST", { ...(amount ? { amount } : {}), ...(notes ? { notes } : {}) }),
+      call(`/payments/${encodeURIComponent(id)}/refund`, "POST", {
+        ...(amount ? { amount } : {}),
+        ...(notes ? { notes } : {}),
+      }),
   };
 }
 
-const hmac = (secret: string, text: string) => crypto.createHmac("sha256", secret).update(text).digest("hex");
+const hmac = (secret: string, text: string) =>
+  crypto.createHmac("sha256", secret).update(text).digest("hex");
 const safeEqual = (a: string, b: string) => {
   const x = Buffer.from(a);
   const y = Buffer.from(b);
@@ -468,8 +548,12 @@ const safeEqual = (a: string, b: string) => {
 };
 
 /** Checkout's handler result: HMAC-SHA256 of "order_id|payment_id" with the key secret. */
-export const checkoutSignatureOk = (cfg: BillingConfig, orderId: string, paymentId: string, signature: string) =>
-  Boolean(cfg.keySecret) && safeEqual(hmac(cfg.keySecret, `${orderId}|${paymentId}`), signature);
+export const checkoutSignatureOk = (
+  cfg: BillingConfig,
+  orderId: string,
+  paymentId: string,
+  signature: string,
+) => Boolean(cfg.keySecret) && safeEqual(hmac(cfg.keySecret, `${orderId}|${paymentId}`), signature);
 
 /** A webhook delivery: HMAC-SHA256 of the raw body (as received, not re-serialised) with the webhook secret. */
 export const webhookSignatureOk = (cfg: BillingConfig, rawBody: string, signature: string) =>
@@ -492,7 +576,7 @@ export type StartResult =
         prefill: { email: string };
         notes: Record<string, string>;
       };
-      quote: { list: string; discount: string; total: string };
+      quote: { list: string; discount: string; tax: string; total: string };
     }
   | { ok: true; free: true; subscription: Subscription }
   | { ok: false; error: string; problem?: CouponProblem };
@@ -502,6 +586,7 @@ export async function quote(
   store: BillingStore,
   input: { user: BillingUser; planId: string; couponCode?: string },
   now = new Date(),
+  taxPercent = 0,
 ): Promise<{ ok: true; quote: Quote } | { ok: false; error: string; problem?: CouponProblem }> {
   const plan = (await store.listPlans()).find((p) => p.id === input.planId && p.active);
   if (!plan) return { ok: false, error: "Please pick a plan first." };
@@ -511,7 +596,7 @@ export async function quote(
     if (!c.ok) return { ok: false, error: c.message, problem: c.problem };
     coupon = c.coupon;
   }
-  return { ok: true, quote: priceWith(plan, coupon) };
+  return { ok: true, quote: priceWith(plan, coupon, taxPercent) };
 }
 
 /**
@@ -526,9 +611,9 @@ export async function startPurchase(
   now = new Date(),
 ): Promise<StartResult> {
   if (!cfg.enabled) return { ok: false, error: "Subscriptions aren't open yet." };
-  const q = await quote(store, input, now);
+  const q = await quote(store, input, now, cfg.taxPercent);
   if (!q.ok) return q;
-  const { plan, coupon, listAmount, discount, amount } = q.quote;
+  const { plan, coupon, listAmount, discount, tax, amount } = q.quote;
   const id = crypto.randomUUID();
 
   if (amount === 0) {
@@ -541,6 +626,7 @@ export async function startPurchase(
         paymentId: null,
         listAmount,
         discount,
+        tax: 0,
         amount: 0,
         currency: plan.currency,
         couponCode: coupon?.code ?? null,
@@ -566,13 +652,23 @@ export async function startPurchase(
       );
       await tx.updatePayment(pay.id, { subscriptionId: sub.id });
       if (coupon)
-        await tx.insertRedemption({ couponCode: coupon.code, userId: input.user.id, paymentId: pay.id, discount, createdAt: now });
+        await tx.insertRedemption({
+          couponCode: coupon.code,
+          userId: input.user.id,
+          paymentId: pay.id,
+          discount,
+          createdAt: now,
+        });
       return sub;
     });
     return { ok: true, free: true, subscription };
   }
 
-  if (!paymentsReady(cfg)) return { ok: false, error: "Online payment isn't open yet. Please write to us from the Help page." };
+  if (!paymentsReady(cfg))
+    return {
+      ok: false,
+      error: "Online payment isn't open yet. Please write to us from the Help page.",
+    };
   const notes: Record<string, string> = { app: cfg.appId, userId: input.user.id, planId: plan.id };
   if (coupon) notes.coupon = coupon.code;
   const order = await api.createOrder({
@@ -589,6 +685,7 @@ export async function startPurchase(
     paymentId: null,
     listAmount,
     discount,
+    tax,
     amount,
     currency: plan.currency,
     couponCode: coupon?.code ?? null,
@@ -607,19 +704,24 @@ export async function startPurchase(
       amount,
       currency: plan.currency,
       name: input.appName,
-      description: `${plan.name} plan · ${plan.days} days`,
+      description: tax
+        ? `${plan.name} plan · ${plan.days} days · incl. GST`
+        : `${plan.name} plan · ${plan.days} days`,
       prefill: { email: input.user.email },
       notes,
     },
     quote: {
       list: formatMoney(listAmount, plan.currency),
       discount: formatMoney(discount, plan.currency),
+      tax: formatMoney(tax, plan.currency),
       total: formatMoney(amount, plan.currency),
     },
   };
 }
 
-export type ActivateResult = { ok: true; already: boolean; subscription: Subscription | null } | { ok: false; error: string };
+export type ActivateResult =
+  | { ok: true; already: boolean; subscription: Subscription | null }
+  | { ok: false; error: string };
 
 /**
  * Count a paid order exactly once, whoever gets here first (the verify route or
@@ -638,14 +740,21 @@ export async function activate(
     if (!row) return { ok: false, error: "We don't recognise that order." };
     if (row.status === "paid") return { ok: true, already: true, subscription: null };
     if (input.payment?.amount !== undefined && Number(input.payment.amount) !== row.amount)
-      return { ok: false, error: `Amount mismatch: Razorpay says ${input.payment.amount}, the order was ${row.amount}.` };
-    const claimed = await tx.claimPayment(input.orderId, row.status === "failed" ? "failed" : "created", {
-      status: "paid",
-      paymentId: input.paymentId,
-      paidAt: now,
-      method: input.payment?.method ?? null,
-      error: null,
-    });
+      return {
+        ok: false,
+        error: `Amount mismatch: Razorpay says ${input.payment.amount}, the order was ${row.amount}.`,
+      };
+    const claimed = await tx.claimPayment(
+      input.orderId,
+      row.status === "failed" ? "failed" : "created",
+      {
+        status: "paid",
+        paymentId: input.paymentId,
+        paidAt: now,
+        method: input.payment?.method ?? null,
+        error: null,
+      },
+    );
     if (!claimed) return { ok: true, already: true, subscription: null };
     const plans = await tx.listPlans();
     const plan = plans.find((p) => p.id === row.planId);
@@ -653,8 +762,15 @@ export async function activate(
     if (row.couponCode) {
       const c = await tx.getCoupon(row.couponCode);
       const total = await tx.countRedemptions(row.couponCode);
-      if (c?.maxRedemptions != null && total >= c.maxRedemptions) note += ` (coupon ${row.couponCode} ran out meanwhile; honoured)`;
-      await tx.insertRedemption({ couponCode: row.couponCode, userId: row.userId, paymentId: row.id, discount: row.discount, createdAt: now });
+      if (c?.maxRedemptions != null && total >= c.maxRedemptions)
+        note += ` (coupon ${row.couponCode} ran out meanwhile; honoured)`;
+      await tx.insertRedemption({
+        couponCode: row.couponCode,
+        userId: row.userId,
+        paymentId: row.id,
+        discount: row.discount,
+        createdAt: now,
+      });
     }
     const sub = await grantPeriod(
       tx,
@@ -684,9 +800,11 @@ export async function verifyCheckout(
   input: { userId: string; orderId: string; paymentId: string; signature: string },
   now = new Date(),
 ): Promise<ActivateResult> {
-  if (!input.orderId || !input.paymentId || !input.signature) return { ok: false, error: "The payment result is incomplete." };
+  if (!input.orderId || !input.paymentId || !input.signature)
+    return { ok: false, error: "The payment result is incomplete." };
   const row = await store.getPaymentByOrder(input.orderId);
-  if (!row || row.userId !== input.userId) return { ok: false, error: "We don't recognise that order." };
+  if (!row || row.userId !== input.userId)
+    return { ok: false, error: "We don't recognise that order." };
   if (!checkoutSignatureOk(cfg, input.orderId, input.paymentId, input.signature))
     return { ok: false, error: "We couldn't verify this payment." };
   if (row.status === "paid") return { ok: true, already: true, subscription: null };
@@ -695,7 +813,8 @@ export async function verifyCheckout(
     payment = await api.fetchPayment(input.paymentId);
     // With automatic capture off, an authorised payment is refunded by the bank
     // after a few days unless it is captured: capture it now.
-    if (payment.status === "authorized") payment = await api.capture(input.paymentId, row.amount, row.currency);
+    if (payment.status === "authorized")
+      payment = await api.capture(input.paymentId, row.amount, row.currency);
   } catch {
     payment = null; // the signature already proves the result; the webhook fills in the rest
   }
@@ -704,7 +823,10 @@ export async function verifyCheckout(
   return activate(store, { orderId: input.orderId, paymentId: input.paymentId, payment }, now);
 }
 
-export type WebhookResult = { status: number; body: { ok: boolean; event?: string; ignored?: string; error?: string } };
+export type WebhookResult = {
+  status: number;
+  body: { ok: boolean; event?: string; ignored?: string; error?: string };
+};
 
 /**
  * The webhook (raw body, header x-razorpay-signature). Handles
@@ -719,8 +841,15 @@ export async function handleWebhook(
   signature: string,
   now = new Date(),
 ): Promise<WebhookResult> {
-  if (!webhookSignatureOk(cfg, rawBody, signature)) return { status: 400, body: { ok: false, error: "Bad signature." } };
-  let event: { event?: string; payload?: { payment?: { entity?: RazorpayPayment }; refund?: { entity?: { payment_id?: string } } } };
+  if (!webhookSignatureOk(cfg, rawBody, signature))
+    return { status: 400, body: { ok: false, error: "Bad signature." } };
+  let event: {
+    event?: string;
+    payload?: {
+      payment?: { entity?: RazorpayPayment };
+      refund?: { entity?: { payment_id?: string } };
+    };
+  };
   try {
     event = JSON.parse(rawBody);
   } catch {
@@ -730,7 +859,11 @@ export async function handleWebhook(
   const p = event.payload?.payment?.entity;
   if ((name === "payment.captured" || name === "order.paid") && p?.order_id) {
     const r = await activate(store, { orderId: p.order_id, paymentId: p.id, payment: p }, now);
-    if (!r.ok) return { status: r.error.startsWith("We don't recognise") ? 200 : 409, body: { ok: false, event: name, error: r.error } };
+    if (!r.ok)
+      return {
+        status: r.error.startsWith("We don't recognise") ? 200 : 409,
+        body: { ok: false, event: name, error: r.error },
+      };
     return { status: 200, body: { ok: true, event: name } };
   }
   if (name === "payment.failed" && p?.order_id) {
@@ -751,18 +884,33 @@ export async function handleWebhook(
 // ---------------------------------------------------------------- admin
 
 /** Admin: give days by hand (a bank transfer, an apology, an extended trial). */
-export const adminGrant = (store: BillingStore, userId: string, days: number, note: string, now = new Date()) =>
-  grantPeriod(store, { userId, planId: "admin", days, source: "admin", note }, now);
+export const adminGrant = (
+  store: BillingStore,
+  userId: string,
+  days: number,
+  note: string,
+  now = new Date(),
+) => grantPeriod(store, { userId, planId: "admin", days, source: "admin", note }, now);
 
 /** Admin: end a period now (after a refund, or a grant made in error). Later periods move up. */
-export async function endPeriod(store: BillingStore, userId: string, subscriptionId: string, now = new Date()) {
-  const subs = (await store.listSubscriptions(userId)).sort((a, b) => a.startsAt.getTime() - b.startsAt.getTime());
+export async function endPeriod(
+  store: BillingStore,
+  userId: string,
+  subscriptionId: string,
+  now = new Date(),
+) {
+  const subs = (await store.listSubscriptions(userId)).sort(
+    (a, b) => a.startsAt.getTime() - b.startsAt.getTime(),
+  );
   const target = subs.find((s) => s.id === subscriptionId);
   if (!target) throw new Error("No such period for this account.");
   if (target.endsAt <= now) return target;
   const cut = target.startsAt > now ? target.startsAt : now;
   const removedMs = target.endsAt.getTime() - cut.getTime();
-  const ended = await store.updateSubscription(target.id, { endsAt: cut, note: `${target.note ?? ""} · ended early`.trim() });
+  const ended = await store.updateSubscription(target.id, {
+    endsAt: cut,
+    note: `${target.note ?? ""} · ended early`.trim(),
+  });
   for (const s of subs.filter((x) => x.startsAt >= target.endsAt))
     await store.updateSubscription(s.id, {
       startsAt: new Date(s.startsAt.getTime() - removedMs),
@@ -774,5 +922,20 @@ export async function endPeriod(store: BillingStore, userId: string, subscriptio
 /** Admin: each coupon with how often it has been used. */
 export async function couponReport(store: BillingStore) {
   const coupons = await store.listCoupons();
-  return Promise.all(coupons.map(async (c) => ({ ...c, used: await store.countRedemptions(c.code) })));
+  return Promise.all(
+    coupons.map(async (c) => ({ ...c, used: await store.countRedemptions(c.code) })),
+  );
+}
+
+/** ADMIN_EMAILS: the accounts that may use /admin/billing and are never walled. */
+export function isAdmin(
+  email: string | null | undefined,
+  env: Record<string, string | undefined> = process.env,
+) {
+  if (!email) return false;
+  const list = (env.ADMIN_EMAILS ?? "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  return list.includes(email.trim().toLowerCase());
 }

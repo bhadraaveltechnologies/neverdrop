@@ -1,6 +1,6 @@
 ---
 name: bhadraavel-razorpay
-description: Add paid plans with Razorpay to an existing Bhadraavel website - several prepaid plans (monthly, quarterly, yearly or any other), Razorpay Checkout with server-side order creation, signature verification and the webhook, a subscription wall that closes the portal to anyone without a current subscription, admin coupon codes (percent or flat amount off, per plan, per person, dated, limited, or free), admin grants and refunds, plus the pricing-page wording, a payments FAQ, and the Privacy, Terms, Cancellation and Refunds, Shipping and Delivery and Contact pages Razorpay's activation review expects. Use whenever the user asks for Razorpay, payments, subscriptions, plans, pricing, a paywall, coupons or discount codes, or refund / payment policy pages in one of the apps.
+description: Add paid plans with Razorpay to an existing Bhadraavel website - several prepaid plans (monthly, quarterly, yearly or any other), Razorpay Checkout with server-side order creation, signature verification and the webhook, a subscription wall that closes the portal to anyone without a current subscription, GST added at checkout (or prices final), an admin screen for plans, coupons and accounts, admin coupon codes (percent or flat amount off, per plan, per person, dated, limited, or free), admin grants and refunds, plus the pricing-page wording, a payments FAQ, and the Privacy, Terms, Cancellation and Refunds, Shipping and Delivery and Contact pages Razorpay's activation review expects. Use whenever the user asks for Razorpay, payments, subscriptions, plans, pricing, a paywall, coupons or discount codes, or refund / payment policy pages in one of the apps.
 ---
 
 # Razorpay plans, coupons and the subscription wall
@@ -14,7 +14,7 @@ customer reads. The pieces:
 |---|---|
 | `reference/billing.ts.txt` | The billing core: plans, coupons, pricing, Razorpay REST client, checkout verification, webhook, access rule, trial, admin grants. Framework- and database-free behind a `BillingStore` interface. **Port the store, keep the logic.** |
 | `reference/memory-store.ts.txt` | A working in-memory `BillingStore` (the tests run on it), each method annotated with its SQL: the template for the real one. |
-| `reference/billing.test.ts.txt` | 14 tests: coupon maths and every refusal, the wall, stacking, the trial, the verify-and-webhook race, signatures, the free-coupon path. Port them with the core. |
+| `reference/billing.test.ts.txt` | 16 tests: coupon maths and every refusal, GST, the wall, stacking, the trial, the verify-and-webhook race, signatures, the free-coupon path, admins. Port them with the core. |
 | `reference/schema.sql` | PostgreSQL tables and the constraints that matter (one trial per account, order ids unique, coupon codes upper-case). |
 | `reference/copy.md` | Every message: pricing page, coupon field, checkout results, the wall, reminders, Account page, admin, store build, release-log lines. |
 | `reference/faq.md` | The customer FAQ for the pricing page, and the operator FAQ. |
@@ -27,9 +27,15 @@ source tree **without** the `.txt` (`billing.ts`, `memory-store.ts`,
 `billing.test.ts`). In the SkillFactory repository,
 `scripts/test-references.sh` runs their tests (Node 22.18+).
 
-Reference app: Memorize It (`lib/billing/`, `/pricing`, `/api/billing/*`)
-was the first; it predates this skill (one trial not stored as a row, prices
-from the environment, no coupons). Build new work to this skill, not to it.
+Reference app: **Memorize It** (1.18.0) is built to this skill and is the
+place to look for a whole working app: `lib/billing/core.ts` (this core),
+`store.ts` (a Drizzle `BillingStore` on Postgres, with the core's tests run
+against it), `server.ts` (per-request access, reminders), `admin.ts` (the
+admin actions, shared by the API and the screen), `app/pricing/page.tsx`
+and `components/plan-checkout.tsx` (Plans, the wall, the summary with GST and
+the coupon field), `app/admin/billing/` (the admin screen),
+`app/api/billing/*` and `app/api/admin/*`, `lib/docs/legal.ts` and
+`lib/docs/billing-faq.ts`, migration `drizzle/0016_plans_coupons.sql`.
 
 ## 1. What the user asked for (1 November 2026)
 
@@ -46,6 +52,10 @@ from the environment, no coupons). Build new work to this skill, not to it.
   subscription for a user (i.e. percent discount or dollar discount)":
   percent off or a flat amount off, and a coupon that covers the whole price
   to switch a plan on for someone.
+- (2 November 2026) "I need coupons / GST / admin screen for this app. If it
+  is missed out in the skill, add it": every app built with this skill gets
+  all three: coupons (decision 10), GST (decision 14) and the admin screen
+  (section 6), not only the admin API.
 
 ## 2. Decisions (the contract; do not reopen without the user)
 
@@ -95,6 +105,15 @@ from the environment, no coupons). Build new work to this skill, not to it.
 13. **The Play Store build sells nothing.** Every price and plan is hidden in
     the Android wrapper (Google's policy for digital goods), with one line
     pointing to the website. A plan bought there works in the app.
+14. **GST is the user's call, and the server adds it.** Ask whether prices
+    include all taxes, have GST added at checkout, or the business is not
+    GST-registered. Plan prices are stored **before GST**; `GST_PERCENT`
+    (18 for most software services; `0` when prices are final) is added after
+    any coupon: list − discount = net, + GST = what Razorpay charges
+    (`priceWith`). The Plans page shows each price with "+ GST", and before
+    paying a summary of price, coupon, GST and total; the payment row keeps
+    list, discount, tax and amount. GST added at checkout needs a GSTIN:
+    remind the user, and show it (`ORG_GSTIN`) on the Contact page.
 
 ## 3. Configuration
 
@@ -109,18 +128,24 @@ pass-through, and the README's configuration table):
 | `RAZORPAY_KEY_SECRET` | Server only. Never in the browser, a mobile bundle, a log or git. |
 | `RAZORPAY_WEBHOOK_SECRET` | The secret typed when adding the webhook in Razorpay. Server only. |
 | `ADMIN_API_KEY` | Bearer key for the admin API (support hub, scripts). |
-| `ADMIN_EMAILS` | Comma-separated accounts that are admins inside the app (if the app has no admin role of its own). |
+| `ADMIN_EMAILS` | Comma-separated accounts that may use the admin screen and are never walled (if the app has no admin role of its own). `isAdmin()` reads it. |
+| `GST_PERCENT` | GST added at checkout after any discount, in percent; `0` = prices are final (decision 14). |
+| `ORG_ADDRESS`, `ORG_GSTIN`, `ORG_PHONE` | The business's registered address, GSTIN and phone (with hours), shown on the Contact page and in the policies **only when set**: never invented, never a visible placeholder. |
 
 Plans are not environment variables: they are rows (section 2.3), seeded by
 the migration in `schema.sql` with the user's names and prices. **Ask the
-user for the plans** (name, days, price) before seeding; show them the
-defaults (₹99 / 30 days, ₹249 / 90 days, ₹799 / 365 days) as a starting
-point only.
+user** before building, in one go: which app; the plans (name, days, price
+before GST; offer ₹99 / 30 days, ₹249 / 90 days, ₹799 / 365 days as a
+starting point only); the trial length; and GST (included, added at checkout,
+or not registered). Business details (address, phone, GSTIN) come later, as
+server settings, never typed into the code.
 
 ```dotenv
 # Plans and payments (bhadraavel-razorpay). Off until BILLING_ENABLED=true.
 BILLING_ENABLED=false
 TRIAL_DAYS=0
+# GST added at checkout, in percent; 0 = prices are final.
+GST_PERCENT=18
 # Razorpay → Settings → API Keys. Test keys first (rzp_test_…), live after activation.
 RAZORPAY_KEY_ID=
 RAZORPAY_KEY_SECRET=
@@ -128,6 +153,10 @@ RAZORPAY_KEY_SECRET=
 RAZORPAY_WEBHOOK_SECRET=
 ADMIN_API_KEY=
 ADMIN_EMAILS=
+# Shown on the Contact page and in the policies when set.
+ORG_ADDRESS=
+ORG_GSTIN=
+ORG_PHONE=
 ```
 
 Secrets are typed by the user into the server's `.env`. Never ask them to
@@ -179,7 +208,7 @@ paste a key or secret into the chat, and never commit one.
    | Route | Does |
    |---|---|
    | `GET /api/billing/plans` (public) | Active plans with formatted prices, and whether billing and payments are on. |
-   | `POST /api/billing/quote` `{ planId, couponCode? }` | `quote()`: the price with the coupon, or the coupon's refusal message. |
+   | `POST /api/billing/quote` `{ planId, couponCode? }` | `quote(…, cfg.taxPercent)`: list, discount, GST and total, formatted; or the coupon's refusal message. |
    | `POST /api/billing/order` `{ planId, couponCode? }` | `startPurchase()`: Checkout options, or `{ free: true }` when a coupon covered it. Rate-limit (10 a minute per account). |
    | `POST /api/billing/verify` `{ orderId, paymentId, signature }` | `verifyCheckout()`, then the person's new access (plan, until). |
    | `POST /api/billing/webhook` (public, no session, no CSRF) | `handleWebhook()` on the **raw body** and the `x-razorpay-signature` header. Answer quickly. Exempt it from the wall and from body parsers that re-serialise JSON. |
@@ -264,6 +293,30 @@ functions; log every admin action with who, what and when.
 | List coupons with uses | `GET /api/admin/billing/coupons` | `couponReport` |
 | Switch a coupon off, change its end or limit | `PATCH /api/admin/billing/coupons/:code` `{ active?, validUntil?, maxRedemptions? }` | `updateCoupon` |
 
+**The admin screen** (`/admin/billing`): a server-rendered page, a plain
+404 for anyone who is not an admin, and every form a server action that
+checks the admin again before doing anything. Top to bottom:
+
+1. **Status line**: billing on or off, payments on or off (and why: keys not
+   set), whether the webhook secret is set, the GST rate and the trial
+   length (copy.md has the wording).
+2. **The message** from the last action (copy.md's admin lines), green or,
+   for an error, in the danger colour.
+3. **Plans**: one row per plan, editable in place (id read-only, name, days,
+   price in rupees before GST, the line under the price, order, Active), and
+   an empty row to add one. Retiring is unticking Active.
+4. **Coupons**: the form below, then a table of every coupon: code, off,
+   plans, for whom, until, used (of how many), and *Switch off* / *Switch on*.
+5. **An account**: look up by email; then where it stands (walled or not,
+   until when), *Give days* with a reason, its periods (each running one with
+   *End now*), and its payments (list − discount + GST = total, status, the
+   Razorpay reference, and *Refund* with an optional part amount). A refund
+   Razorpay could not take says so and that nothing was refunded.
+
+Money is typed in rupees on the forms and stored in paise. Dates on the
+coupon form are the app's time zone, the end date counting to the end of
+that day.
+
 **The coupon form** (admin screen): Code (or *Make one*: 8 letters and
 digits, no look-alikes 0/O/1/I) · Discount: *percent* (1–100) or *amount*
 (in rupees on the form, stored in paise) · Plans: all, or tick some · For one
@@ -309,6 +362,11 @@ to share. Typical uses:
 - Trial granted once, also to accounts made before switch-on.
 - Coupons: every refusal shows its copy.md line; usage counted only on
   payment; 100% coupons skip Razorpay; sub-₹1 results round to ₹1.
+- GST: prices shown with "+ GST" (or nothing when `GST_PERCENT=0`); the
+  summary before paying shows price, coupon, GST and total; Razorpay is asked
+  for the total; the payment row keeps list, discount, tax and amount.
+- The admin screen exists (not only the API), is a 404 for non-admins, and
+  logs every action; plans, coupons and accounts all work from it.
 - Refund marks the payment; access changes only through the admin.
 - Pricing page, wall, Account section, reminders, admin screen and policy
   pages read exactly as copy.md and legal.md (business details filled in by
