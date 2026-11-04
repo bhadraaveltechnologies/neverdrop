@@ -1,6 +1,6 @@
 ---
 name: bhadraavel-image-editor
-description: Add the standard Bhadraavel image editor to any of the user's apps - upload an image and edit it in the browser (zoom with a slider, wheel or pinch; drag to pan; rotate; fit or fill; crop to a square or a circle; background transparent, white or the app's colour; live preview at the sizes the app uses), then upload only the cropped, resized result, checked again on the server and stored so backups carry it. Used for the clinic or app logo and for people's photos (doctors, physios, staff). Only the Bhadraavel support team (the app's operator role) may upload or change these images. Use whenever the user asks for a logo upload, a profile or staff photo, an avatar, an image crop/zoom/pan/resize tool, or says the app's logo or someone's picture should be changeable in the app.
+description: Add the standard Bhadraavel image editor to any of the user's apps - upload an image (choose, drop, or paste from the clipboard) and edit it in the browser (zoom with a slider, wheel or pinch; drag to pan; rotate; fit or fill; crop to a square or a circle; background transparent, white or the app's colour; live preview at the sizes the app uses), then upload only the cropped, resized result, checked again on the server and stored so backups carry it. Used for the clinic or app logo and for people's photos (doctors, physios, staff). Only the Bhadraavel support team (the app's operator role) may upload or change these images. Use whenever the user asks for a logo upload, a profile or staff photo, an avatar, an image crop/zoom/pan/resize tool, or says the app's logo or someone's picture should be changeable in the app.
 ---
 
 # Bhadraavel image editor
@@ -25,6 +25,7 @@ finished 512 px square; the server re-checks the bytes and stores it.
 - "When I meant support can upload, **only Bhadraavel support team** can do
   this."
 - "Have this image editor as a skill … and push this skill to all repos."
+- "Do we allow copy paste of images from clipboard?" … "yes, add it"
 
 ## 2. Decisions (do not reopen without the user)
 
@@ -67,7 +68,20 @@ Props in the React version: `current` (saved image URL or null), `brand`
 saved message), `previews` (two labels).
 
 - **Load**: a file input (`accept="image/png,image/jpeg,image/webp,image/svg+xml"`)
-  inside a dashed drop zone that also takes a dropped file. Refuse non-images
+  inside a dashed drop zone that also takes a dropped file, **or paste**:
+  - **Ctrl+V / ⌘V anywhere on the page** while the editor is shown: a
+    `document` `paste` listener takes the first `clipboardData.items` entry
+    with `kind === "file"` and an `image/*` type, calls `preventDefault()` and
+    loads it (name it "pasted image": browsers call every paste `image.png`).
+    Anything else (text) is left alone, so form fields on the page still work.
+  - A **"Paste image from clipboard"** button calling `navigator.clipboard.read()`
+    and loading the first `image/*` type. Decide whether to show it *after
+    mount* (`clipboard.read` and `ClipboardItem` exist: Chrome, Edge, Safari;
+    not Firefox), so server and browser render the same. Say so plainly when
+    the clipboard holds no image ("copy an image first: right-click → Copy
+    image") or permission is refused ("allow it, or press Ctrl+V").
+  - The hint under the drop zone says paste works: "Copied an image? Press
+    Ctrl+V (⌘V on a Mac) anywhere on this page." Refuse non-images
   and files over 20 MB. If the browser cannot decode it (iPhone **HEIC**
   usually), say so and ask for PNG/JPG. Warn (do not block) under 128 px.
 - **Crop area**: a 320 px square `<canvas>` (scaled by `devicePixelRatio`,
@@ -150,7 +164,10 @@ versioned URL or null (null too when the table does not exist yet), and a
   export it as PNG.
 - Run the app's own checks after wiring it (`tsc`, build), and a browser
   check: as an operator load a wide image and a tall one, fill, drag, zoom,
-  rotate, save; the served image is 512×512; it shows in every place in
+  rotate, save; paste an image (dispatch a `paste` `ClipboardEvent` carrying
+  a `DataTransfer` with the file; for the button, grant `clipboard-read` and
+  write a `ClipboardItem` first) and a text paste into a field (must not be
+  taken over); the served image is 512×512; it shows in every place in
   section 5; a non-operator gets 403.
 
 ## 7. Done when
