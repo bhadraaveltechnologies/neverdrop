@@ -39,6 +39,7 @@ export function ImageEditor({ current, brand, fallback, endpoint, noun, shape, w
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [canReadClipboard, setCanReadClipboard] = useState(false); // decided after mount, so server and browser render the same
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const smallRef = useRef<HTMLCanvasElement>(null);
   const bigRef = useRef<HTMLCanvasElement>(null);
@@ -103,6 +104,47 @@ export function ImageEditor({ current, brand, fallback, endpoint, noun, shape, w
       draw(p, size * dpr);
     }
   }, [draw]);
+
+  // Paste: Ctrl+V / Cmd+V anywhere on the page while the editor is shown
+  // loads a copied image (a screenshot, an image copied from a website or
+  // WhatsApp Web). Text pastes are left alone, so form fields still work.
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      if (busy) return;
+      const item = [...(e.clipboardData?.items ?? [])].find((i) => i.kind === "file" && i.type.startsWith("image/"));
+      const file = item?.getAsFile();
+      if (!file) return;
+      e.preventDefault();
+      load(new File([file], file.name && file.name !== "image.png" ? file.name : "pasted image", { type: file.type }));
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  });
+
+  useEffect(() => {
+    setCanReadClipboard(typeof navigator !== "undefined" && typeof navigator.clipboard?.read === "function" && typeof window.ClipboardItem === "function");
+  }, []);
+
+  // The "Paste image" button: reads the clipboard on click (Chrome and Edge
+  // ask once for permission). Shown only where the browser supports it.
+  async function pasteFromClipboard() {
+    setMsg(null);
+    try {
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        const type = item.types.find((t) => t.startsWith("image/"));
+        if (type) {
+          const blob = await item.getType(type);
+          load(new File([blob], "pasted image", { type }));
+          return;
+        }
+      }
+      setMsg({ ok: false, text: "There is no image on the clipboard. Copy an image first (right-click it → Copy image), then paste." });
+    } catch (e) {
+      const denied = (e as Error).name === "NotAllowedError";
+      setMsg({ ok: false, text: denied ? "The browser did not allow reading the clipboard. Allow it when asked, or press Ctrl+V (⌘V on a Mac) instead." : "Could not read the clipboard. Press Ctrl+V (⌘V on a Mac) instead, or choose the file." });
+    }
+  }
 
   function load(file: File) {
     setMsg(null);
@@ -247,10 +289,15 @@ export function ImageEditor({ current, brand, fallback, endpoint, noun, shape, w
         onDragLeave={() => setDragOver(false)}
         onDrop={(e) => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files[0]; if (f) load(f); }}
       >
-        <strong>{img ? `Editing ${name} · choose another image` : "Choose an image, or drop it here"}</strong>
-        <span className="small muted">PNG, JPG, WebP or SVG. A large, sharp original works best; you crop it next.</span>
+        <strong>{img ? `Editing ${name} · choose, drop or paste another image` : "Choose an image, drop it here, or paste it"}</strong>
+        <span className="small muted">PNG, JPG, WebP or SVG. Copied an image? Press Ctrl+V (⌘V on a Mac) anywhere on this page. A large, sharp original works best; you crop it next.</span>
         <input type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" className="sr" onChange={(e) => { const f = e.target.files?.[0]; if (f) load(f); e.target.value = ""; }} />
       </label>
+      {canReadClipboard && (
+        <div className="row-s" style={{ marginTop: -8 }}>
+          <button type="button" className="btn small" onClick={pasteFromClipboard} disabled={busy}>Paste image from clipboard</button>
+        </div>
+      )}
 
       {img && (
         <div className="cols" style={{ gap: 24 }}>
