@@ -1,0 +1,325 @@
+// bhadraavel-image-editor reference: the React editor (client component).
+// In the skill this is ImageEditor.tsx.txt; copy it into the app as
+// components/ImageEditor.tsx. It uses the app's own CSS classes (card, btn,
+// chip, chips, field, row, notice, logo, has-img, sr, small, muted); map them
+// to the app's styles. Proven in myclinicapp.
+"use client";
+import { useCallback, useEffect, useRef, useState } from "react";
+
+// Image editor for Bhadraavel operators (the clinic logo, and doctors' and
+// physios' photos): load an image, then zoom, pan, rotate and crop it to a
+// square; the browser renders the result at OUTPUT px and uploads only that.
+// The server never sees the original photo.
+
+const BOX = 320; // on-screen crop square, CSS px
+const OUTPUT = 512; // saved image, px
+const MAX_BYTES = 600 * 1024;
+
+type Bg = "transparent" | "white" | "brand";
+
+export type ImageEditorProps = {
+  current: string | null; // the saved image's address, or null
+  brand: string; // clinic colour, for the background option and preview
+  fallback: string; // what shows when there is no image (initials)
+  endpoint: string; // POST the image here; DELETE removes it
+  noun: "logo" | "photo";
+  shape: "square" | "round"; // round = portrait, shown in a circle
+  where: string; // where it appears, for the saved message
+  previews: [string, string]; // labels for the small and large preview
+};
+
+export function ImageEditor({ current, brand, fallback, endpoint, noun, shape, where, previews }: ImageEditorProps) {
+  const radius = (size: number) => (shape === "round" ? "50%" : `${Math.round(size * 0.22)}px`);
+  const [img, setImg] = useState<HTMLImageElement | null>(null);
+  const [name, setName] = useState("");
+  const [zoom, setZoom] = useState(1); // 1 = the image's longer side fits the square ("Fit")
+  const [pan, setPan] = useState({ x: 0, y: 0 }); // offset of the image centre from the square's centre, CSS px of the box
+  const [rot, setRot] = useState(0); // quarter turns
+  const [bg, setBg] = useState<Bg>(shape === "round" ? "white" : "transparent");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const smallRef = useRef<HTMLCanvasElement>(null);
+  const bigRef = useRef<HTMLCanvasElement>(null);
+  const pointers = useRef(new Map<number, { x: number; y: number }>());
+  const pinch = useRef<{ dist: number; zoom: number } | null>(null);
+
+  // Scale that makes the (rotated) image's longer side equal the box.
+  const fitScale = useCallback((im: HTMLImageElement, quarter: number) => {
+    const w = quarter % 2 ? im.naturalHeight : im.naturalWidth;
+    const h = quarter % 2 ? im.naturalWidth : im.naturalHeight;
+    return BOX / Math.max(w, h);
+  }, []);
+  const fillZoom = useCallback((im: HTMLImageElement, quarter: number) => {
+    const w = quarter % 2 ? im.naturalHeight : im.naturalWidth;
+    const h = quarter % 2 ? im.naturalWidth : im.naturalHeight;
+    return Math.max(w, h) / Math.min(w, h);
+  }, []);
+
+  /** Draws the current crop onto a square canvas of `px` pixels. */
+  const draw = useCallback(
+    (canvas: HTMLCanvasElement, px: number, showGuides = false) => {
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, px, px);
+      if (bg !== "transparent") {
+        ctx.fillStyle = bg === "white" ? "#ffffff" : brand;
+        ctx.fillRect(0, 0, px, px);
+      } else if (showGuides) {
+        // checkerboard so transparency is visible while editing
+        const s = px / 16;
+        for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
+          ctx.fillStyle = (x + y) % 2 ? "#e9eeec" : "#ffffff";
+          ctx.fillRect(x * s, y * s, s, s);
+        }
+      }
+      if (!img) return;
+      const k = px / BOX;
+      const scale = fitScale(img, rot) * zoom * k;
+      ctx.imageSmoothingQuality = "high";
+      ctx.translate(px / 2 + pan.x * k, px / 2 + pan.y * k);
+      ctx.rotate((rot * Math.PI) / 2);
+      ctx.scale(scale, scale);
+      ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+    },
+    [img, zoom, pan, rot, bg, brand, fitScale],
+  );
+
+  useEffect(() => {
+    const dpr = typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 3) : 1;
+    const c = canvasRef.current;
+    if (c) {
+      c.width = BOX * dpr;
+      c.height = BOX * dpr;
+      draw(c, BOX * dpr, true);
+    }
+    for (const [ref, size] of [[smallRef, 34], [bigRef, 56]] as const) {
+      const p = ref.current;
+      if (!p) continue;
+      p.width = size * dpr;
+      p.height = size * dpr;
+      draw(p, size * dpr);
+    }
+  }, [draw]);
+
+  function load(file: File) {
+    setMsg(null);
+    if (!file.type.startsWith("image/")) return setMsg({ ok: false, text: "Please choose an image file (PNG, JPG, WebP or SVG)." });
+    if (file.size > 20 * 1024 * 1024) return setMsg({ ok: false, text: "That file is over 20 MB. Please choose a smaller image." });
+    const url = URL.createObjectURL(file);
+    const im = new Image();
+    im.onload = () => {
+      URL.revokeObjectURL(url);
+      if (!im.naturalWidth || !im.naturalHeight) return setMsg({ ok: false, text: "That image has no size. Please try another." });
+      setImg(im);
+      setName(file.name);
+      setRot(0);
+      setZoom(1);
+      setPan({ x: 0, y: 0 });
+      if (im.naturalWidth < 128 && im.naturalHeight < 128) setMsg({ ok: false, text: `This image is very small, so the ${noun} may look blurred. A larger original (at least 512 px) will be sharper.` });
+    };
+    im.onerror = () => {
+      URL.revokeObjectURL(url);
+      setMsg({ ok: false, text: "This browser could not open that image (iPhone HEIC photos often can't). Please save it as PNG or JPG and try again." });
+    };
+    im.src = url;
+  }
+
+  const clampZoom = (z: number) => Math.min(8, Math.max(0.2, z));
+
+  function onPointerDown(e: React.PointerEvent) {
+    if (!img) return;
+    (e.target as Element).setPointerCapture(e.pointerId);
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.current.size === 2) {
+      const [a, b] = [...pointers.current.values()];
+      pinch.current = { dist: Math.hypot(a.x - b.x, a.y - b.y), zoom };
+    }
+  }
+  function onPointerMove(e: React.PointerEvent) {
+    const prev = pointers.current.get(e.pointerId);
+    if (!prev) return;
+    const next = { x: e.clientX, y: e.clientY };
+    pointers.current.set(e.pointerId, next);
+    if (pointers.current.size === 2 && pinch.current) {
+      const [a, b] = [...pointers.current.values()];
+      setZoom(clampZoom((pinch.current.zoom * Math.hypot(a.x - b.x, a.y - b.y)) / pinch.current.dist));
+    } else if (pointers.current.size === 1) {
+      setPan((p) => ({ x: p.x + next.x - prev.x, y: p.y + next.y - prev.y }));
+    }
+  }
+  function onPointerUp(e: React.PointerEvent) {
+    pointers.current.delete(e.pointerId);
+    if (pointers.current.size < 2) pinch.current = null;
+  }
+
+  // Wheel zoom needs a non-passive listener so the page doesn't scroll.
+  useEffect(() => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!img) return;
+      e.preventDefault();
+      setZoom((z) => clampZoom(z * Math.exp(-e.deltaY * 0.0015)));
+    };
+    c.addEventListener("wheel", onWheel, { passive: false });
+    return () => c.removeEventListener("wheel", onWheel);
+  }, [img]);
+
+  function onKey(e: React.KeyboardEvent) {
+    if (!img) return;
+    const step = e.shiftKey ? 20 : 4;
+    const keys: Record<string, () => void> = {
+      ArrowLeft: () => setPan((p) => ({ ...p, x: p.x - step })),
+      ArrowRight: () => setPan((p) => ({ ...p, x: p.x + step })),
+      ArrowUp: () => setPan((p) => ({ ...p, y: p.y - step })),
+      ArrowDown: () => setPan((p) => ({ ...p, y: p.y + step })),
+      "+": () => setZoom((z) => clampZoom(z * 1.1)),
+      "=": () => setZoom((z) => clampZoom(z * 1.1)),
+      "-": () => setZoom((z) => clampZoom(z / 1.1)),
+    };
+    if (keys[e.key]) {
+      e.preventDefault();
+      keys[e.key]();
+    }
+  }
+
+  function rotate(dir: 1 | -1) {
+    const r = (rot + dir + 4) % 4;
+    setRot(r);
+    setPan(({ x, y }) => (dir === 1 ? { x: -y, y: x } : { x: y, y: -x }));
+  }
+
+  async function save() {
+    if (!img) return;
+    setBusy(true);
+    setMsg(null);
+    try {
+      const out = document.createElement("canvas");
+      out.width = OUTPUT;
+      out.height = OUTPUT;
+      draw(out, OUTPUT);
+      const toBlob = (type: string, q?: number) => new Promise<Blob | null>((res) => out.toBlob(res, type, q));
+      let blob = await toBlob("image/png");
+      // A photo can be large as PNG; WebP keeps it small (and transparency).
+      if (blob && blob.size > MAX_BYTES) blob = await toBlob("image/webp", 0.9);
+      if (!blob || blob.size > MAX_BYTES) throw new Error(`The cropped ${noun} is still too large. Try a simpler image or a plain background.`);
+      const r = await fetch(endpoint, { method: "POST", headers: { "content-type": blob.type }, body: blob });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error ?? `Could not save the ${noun}.`);
+      setMsg({ ok: true, text: `Saved. The ${noun} now shows ${where}.` });
+      setTimeout(() => window.location.reload(), 1200);
+    } catch (e) {
+      setMsg({ ok: false, text: (e as Error).message });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove() {
+    if (!confirm(`Remove the ${noun}? The initials will show instead.`)) return;
+    setBusy(true);
+    const r = await fetch(endpoint, { method: "DELETE" });
+    setBusy(false);
+    if (r.ok) window.location.reload();
+    else setMsg({ ok: false, text: `Could not remove the ${noun}.` });
+  }
+
+  return (
+    <div className="stack">
+      <div className="row" style={{ alignItems: "center" }}>
+        <span className="small muted">Now:</span>
+        {current ? (
+          <span className="logo has-img" style={{ width: 56, height: 56, borderRadius: radius(56) }}><img src={current} alt={`Current ${noun}`} /></span>
+        ) : (
+          <span className="logo" style={{ width: 56, height: 56, fontSize: 20, borderRadius: radius(56) }}>{fallback}</span>
+        )}
+        <span className="small muted">{current ? `${noun === "logo" ? "Clinic logo" : "Photo"} in use` : `No ${noun} yet: the initials show`}</span>
+        {current && <button type="button" className="btn small danger" onClick={remove} disabled={busy}>Remove {noun}</button>}
+      </div>
+
+      <label
+        className="card stack-s"
+        style={{ borderStyle: "dashed", textAlign: "center", cursor: "pointer", background: dragOver ? "var(--brand-soft)" : undefined }}
+        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files[0]; if (f) load(f); }}
+      >
+        <strong>{img ? `Editing ${name} · choose another image` : "Choose an image, or drop it here"}</strong>
+        <span className="small muted">PNG, JPG, WebP or SVG. A large, sharp original works best; you crop it next.</span>
+        <input type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" className="sr" onChange={(e) => { const f = e.target.files?.[0]; if (f) load(f); e.target.value = ""; }} />
+      </label>
+
+      {img && (
+        <div className="cols" style={{ gap: 24 }}>
+          <div className="stack-s" style={{ flex: "0 1 auto" }}>
+            <canvas
+              ref={canvasRef}
+              tabIndex={0}
+              role="img"
+              aria-label={`${noun === "logo" ? "Logo" : "Photo"} crop area. Drag to move, scroll or pinch to zoom; arrow keys move, plus and minus zoom.`}
+              style={{ width: BOX, height: BOX, maxWidth: "100%", aspectRatio: "1", borderRadius: shape === "round" ? "50%" : 14, border: "2px solid var(--brand)", touchAction: "none", cursor: "grab", display: "block" }}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+              onPointerCancel={onPointerUp}
+              onKeyDown={onKey}
+            />
+            <span className="tiny muted">Drag to move · scroll or pinch to zoom · arrow keys and + / − work too. Everything inside the {shape === "round" ? "circle" : "square"} is the {noun}.</span>
+          </div>
+
+          <div className="stack" style={{ flex: "1 1 260px" }}>
+            <label className="field">Zoom
+              <input type="range" min={0.2} max={8} step={0.01} value={zoom} onChange={(e) => setZoom(Number(e.target.value))} />
+            </label>
+            <div className="row-s">
+              <button type="button" className="btn small" onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}>Fit whole image</button>
+              <button type="button" className="btn small" onClick={() => { setZoom(fillZoom(img, rot)); setPan({ x: 0, y: 0 }); }}>Fill the {shape === "round" ? "circle" : "square"}</button>
+              <button type="button" className="btn small" onClick={() => rotate(-1)} aria-label="Rotate left">⟲ Rotate</button>
+              <button type="button" className="btn small" onClick={() => rotate(1)} aria-label="Rotate right">⟳ Rotate</button>
+            </div>
+            <fieldset style={{ border: 0, padding: 0, margin: 0 }}>
+              <legend className="small strong muted" style={{ marginBottom: 6 }}>Background</legend>
+              <div className="chips">
+                {(["transparent", "white", "brand"] as Bg[]).map((b) => (
+                  <label key={b} className="chip"><input type="radio" name="bg" checked={bg === b} onChange={() => setBg(b)} />{b === "brand" ? "Clinic colour" : b === "white" ? "White" : "Transparent"}</label>
+                ))}
+              </div>
+            </fieldset>
+            <div className="stack-s">
+              <span className="small strong muted">Preview</span>
+              <div className="row" style={{ background: "#fff", border: "1px solid var(--line)", borderRadius: 10, padding: "8px 12px" }}>
+                <canvas ref={smallRef} style={{ width: 34, height: 34, borderRadius: radius(34) }} aria-hidden="true" />
+                <strong>{previews[0]}</strong>
+              </div>
+              <div className="row" style={{ background: brand, color: "#fff", borderRadius: 10, padding: "8px 12px" }}>
+                <canvas ref={bigRef} style={{ width: 56, height: 56, borderRadius: radius(56), background: "#fff" }} aria-hidden="true" />
+                <strong>{previews[1]}</strong>
+              </div>
+            </div>
+            <div className="row">
+              <button type="button" className="btn primary" onClick={save} disabled={busy}>{busy ? "Saving…" : `Save ${noun}`}</button>
+              <button type="button" className="btn" onClick={() => { setImg(null); setMsg(null); }} disabled={busy}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {msg && <div className={`notice ${msg.ok ? "ok" : "err"}`} role={msg.ok ? "status" : "alert"}>{msg.text}</div>}
+    </div>
+  );
+}
+
+/* Usage (from myclinicapp):
+
+   // Clinic logo, square, on the operator page
+   <ImageEditor current={await logoSrc()} brand={cfg.brand.primary} fallback={cfg.initials}
+     endpoint="/api/brand/logo" noun="logo" shape="square"
+     where="across the app, the booking page and printed documents" previews={["Staff header", "Booking page"]} />
+
+   // A doctor's photo, round, on the staff member's page, shown only to operators
+   <ImageEditor current={photo} brand={cfg.brand.primary} fallback={initialsOf(s.name)}
+     endpoint={`/api/brand/staff/${s.id}`} noun="photo" shape="round"
+     where="on the booking page, appointment links and staff screens" previews={["Staff lists", "Booking page"]} />
+*/

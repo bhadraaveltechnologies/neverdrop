@@ -1,0 +1,52 @@
+// In the skill this is image-check.test.ts.txt; scripts/test-references.sh in the
+// SkillFactory copies it out as image-check.test.ts and runs it with `node --test`.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { deflateSync } from "node:zlib";
+import { imageProblem, sniffImage } from "./image-check.ts";
+
+// A real, minimal PNG of w×h (solid colour), so the header checks run on genuine bytes.
+function png(w: number, h: number): Uint8Array {
+  const crcTable = Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+  const crc = (b: Buffer) => { let c = 0xffffffff; for (const x of b) c = crcTable[(c ^ x) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+  const chunk = (type: string, data: Buffer) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type), data]);
+    const c = Buffer.alloc(4); c.writeUInt32BE(crc(td));
+    return Buffer.concat([len, td, c]);
+  };
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+  const raw = Buffer.alloc((w * 3 + 1) * h);
+  return new Uint8Array(Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk("IHDR", ihdr), chunk("IDAT", deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]));
+}
+
+test("reads PNG size from the file itself", () => {
+  assert.deepEqual(sniffImage(png(512, 512)), { mime: "image/png", width: 512, height: 512 });
+  assert.equal(sniffImage(new TextEncoder().encode("<svg xmlns='http://www.w3.org/2000/svg'/>")), null);
+});
+
+test("only a small square PNG/WebP of sensible size is accepted", () => {
+  assert.equal(imageProblem(png(512, 512)), null);
+  assert.match(imageProblem(png(512, 300))!, /square/);
+  assert.match(imageProblem(png(64, 64))!, /between/);
+  assert.match(imageProblem(png(2048, 2048))!, /between/);
+  assert.match(imageProblem(new TextEncoder().encode("GIF89a........................"))!, /PNG or WebP/);
+  assert.match(imageProblem(new Uint8Array(700 * 1024))!, /under/);
+  assert.match(imageProblem(new Uint8Array(0))!, /No image/);
+});
+
+test("reads WebP sizes (lossless VP8L and extended VP8X headers)", () => {
+  // VP8X: 24-bit (width-1) and (height-1) at bytes 24 and 27.
+  const x = new Uint8Array(40);
+  x.set(new TextEncoder().encode("RIFF"), 0); x.set(new TextEncoder().encode("WEBPVP8X"), 8);
+  x[24] = 511 & 0xff; x[25] = 511 >> 8; x[27] = 511 & 0xff; x[28] = 511 >> 8;
+  assert.deepEqual(sniffImage(x), { mime: "image/webp", width: 512, height: 512 });
+  // VP8L: 14-bit (width-1) and (height-1) packed after the 0x2f signature byte at 20.
+  const l = new Uint8Array(40);
+  l.set(new TextEncoder().encode("RIFF"), 0); l.set(new TextEncoder().encode("WEBPVP8L"), 8);
+  l[20] = 0x2f;
+  const w = 255, h = 255; // 256 x 256
+  const bits = w | (h << 14);
+  l[21] = bits & 0xff; l[22] = (bits >> 8) & 0xff; l[23] = (bits >> 16) & 0xff; l[24] = (bits >> 24) & 0xff;
+  assert.deepEqual(sniffImage(l), { mime: "image/webp", width: 256, height: 256 });
+});
