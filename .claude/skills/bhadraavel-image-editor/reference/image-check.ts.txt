@@ -1,0 +1,47 @@
+// bhadraavel-image-editor: the server-side check for an image the editor
+// uploads. Pure (no database, no framework), so any Node server can use it.
+// In the skill this file is image-check.ts.txt; copy it into the app as
+// image-check.ts (or .js, dropping the type annotations).
+//
+// The browser has already cropped and resized the image to a square; the
+// server re-checks the real bytes (never the declared content type): a PNG or
+// WebP, square, 128 to 1024 px, under 600 KB.
+
+export const IMAGE_MAX_BYTES = 600 * 1024;
+export const IMAGE_MIN_PX = 128;
+export const IMAGE_MAX_PX = 1024;
+
+export type ImageInfo = { mime: "image/png" | "image/webp"; width: number; height: number };
+
+/** Reads the type and size from the file's own header, never trusting the declared content type. Pure; unit-tested. */
+export function sniffImage(buf: Uint8Array): ImageInfo | null {
+  const u32 = (o: number) => ((buf[o] << 24) | (buf[o + 1] << 16) | (buf[o + 2] << 8) | buf[o + 3]) >>> 0;
+  // PNG: signature, then the IHDR chunk with width and height.
+  const png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  if (buf.length > 24 && png.every((b, i) => buf[i] === b) && String.fromCharCode(...buf.slice(12, 16)) === "IHDR") {
+    return { mime: "image/png", width: u32(16), height: u32(20) };
+  }
+  // WebP: RIFF....WEBP, then a VP8 / VP8L / VP8X chunk.
+  const ascii = (a: number, b: number) => String.fromCharCode(...buf.slice(a, b));
+  if (buf.length > 30 && ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") {
+    const kind = ascii(12, 16);
+    if (kind === "VP8X") return { mime: "image/webp", width: 1 + (buf[24] | (buf[25] << 8) | (buf[26] << 16)), height: 1 + (buf[27] | (buf[28] << 8) | (buf[29] << 16)) };
+    if (kind === "VP8L") {
+      const b = buf.slice(21, 25);
+      return { mime: "image/webp", width: 1 + (((b[1] & 0x3f) << 8) | b[0]), height: 1 + (((b[3] & 0xf) << 10) | (b[2] << 2) | ((b[1] & 0xc0) >> 6)) };
+    }
+    if (kind === "VP8 ") return { mime: "image/webp", width: (buf[26] | (buf[27] << 8)) & 0x3fff, height: (buf[28] | (buf[29] << 8)) & 0x3fff };
+  }
+  return null;
+}
+
+/** Why this image can't be stored as a logo or photo, or null when it can. */
+export function imageProblem(buf: Uint8Array): string | null {
+  if (!buf.length) return "No image was received.";
+  if (buf.length > IMAGE_MAX_BYTES) return `The image is ${Math.round(buf.length / 1024)} KB; please keep it under ${IMAGE_MAX_BYTES / 1024} KB.`;
+  const info = sniffImage(buf);
+  if (!info) return "The image must be a PNG or WebP.";
+  if (info.width !== info.height) return "The image must be square.";
+  if (info.width < IMAGE_MIN_PX || info.width > IMAGE_MAX_PX) return `The image must be between ${IMAGE_MIN_PX} and ${IMAGE_MAX_PX} pixels wide.`;
+  return null;
+}
