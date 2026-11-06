@@ -1,0 +1,225 @@
+// Error reporting to the Bhadraavel support hub (the "error bus"; see
+// docs/error-bus-design.md in the support-hub repo). Server-side only: the
+// hub key never reaches a browser; browser errors come in through
+// /api/errors, which adds the signed-in user and hands them here.
+//
+// Rules this file keeps:
+//   - It can never hurt the app. Nothing here throws; reports are queued and
+//     sent in the background with a short timeout; when the hub is down they
+//     are dropped (an error log isn't worth slowing a clinic down for).
+//   - Patient data never leaves the clinic. Request bodies, query strings,
+//     cookies and signed links are never collected; every string is scrubbed;
+//     the "user" is a staff id and role, never a patient.
+//   - The hub's switch is the switch: the hub's config is polled every few
+//     minutes, and "off" there stops sending at the source.
+// The app's version string; myclinicapp imports APP_VERSION from ./config instead.
+const APP_VERSION = process.env.APP_VERSION || "0.0.0";
+
+export type Level = "fatal" | "error" | "warning";
+export interface Ctx {
+  level?: Level;
+  source?: "server" | "client" | "job" | "public";
+  route?: string | null;      // a route TEMPLATE (/visit/[appointmentId]), never a real path
+  routeType?: string;
+  method?: string;
+  status?: number;
+  user?: { id: string; role: string } | null;
+  tags?: Record<string, string | number | boolean>;
+  runtime?: Record<string, string | null>;
+  fingerprint?: string;
+  platform?: "node" | "browser";
+}
+
+const HUB = () => (process.env.SUPPORT_HUB_URL || "https://support.bhadraaveltechnologies.com").replace(/\/+$/, "");
+const KEY = () => process.env.SUPPORT_HUB_KEY || "";
+const KILL = () => process.env.ERRORS_DISABLED === "1";
+export const RELEASE = `${APP_VERSION}${process.env.GIT_SHA ? `+${process.env.GIT_SHA.slice(0, 7)}` : ""}`;
+const INSTANCE = () => process.env.CLIENT_ID || "unknown";
+const ENV = () => process.env.NODE_ENV === "production" ? "production" : "development";
+
+// ── Expected failures are not errors ────────────────────────────────────────
+// Things the app refuses on purpose (a taken slot, a wrong code, bad config
+// the operator must fix) already show the person a gentle message; they are
+// not bugs. Mark a class with EXPECTED, or a single error with expected(err).
+const EXPECTED = new WeakSet<object>();
+export function expected<T extends object>(err: T): T { EXPECTED.add(err); return err; }
+const EXPECTED_NAMES = new Set(["SlotTaken", "OtpError", "NEXT_REDIRECT", "NEXT_NOT_FOUND", "AbortError"]);
+export function isExpected(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  if (EXPECTED.has(err)) return true;
+  const e = err as { name?: string; digest?: string; constructor?: { name?: string } };
+  if (typeof e.digest === "string" && /^NEXT_(REDIRECT|NOT_FOUND)/.test(e.digest)) return true;
+  return EXPECTED_NAMES.has(e.name ?? "") || EXPECTED_NAMES.has(e.constructor?.name ?? "");
+}
+
+// ── Scrubbing (the hub scrubs again) ────────────────────────────────────────
+const PATTERNS: [RegExp, string][] = [
+  [/\b(?:bearer|basic)\s+[a-z0-9._~+/-]{12,}=*/gi, "[token]"],
+  [/\bsh_[a-z0-9_-]{10,}/gi, "[token]"],
+  [/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, "[email]"],
+  [/(?:\+91[\s-]?)?(?<![\d/])[6-9]\d{4}[\s-]?\d{5}(?![\d/])/g, "[phone]"],
+  [/\b\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g, "[id-number]"],
+  [/\b(code|otp|pin)\b([^\d]{0,12})\d{4,8}\b/gi, "$1$2[code]"],
+  [/\/(a|d)\/[A-Za-z0-9._-]{16,}/g, "/$1/[token]"],
+  [/(https?:\/\/[^\s"'<>?#]+)\?[^\s"'<>#]*/g, "$1?[query]"],
+  [/\b[A-Z]{1,4}\/\d{2}-\d{2}\/\d{3,8}\b/g, "[bill-no]"],
+];
+export function scrub(s: string): string {
+  let out = s.length > 2000 ? s.slice(0, 2000) + "…" : s;
+  for (const [re, rep] of PATTERNS) out = out.replace(re, rep);
+  return out;
+}
+
+// Postgres errors carry row values in `detail` ("Key (phone)=(…) already exists"). Keep the code, drop the values.
+function pgBits(err: unknown): Record<string, string> | null {
+  const e = err as { code?: string; constraint?: string; table?: string; routine?: string };
+  if (!e || typeof e.code !== "string" || !/^[0-9A-Z]{5}$/.test(e.code)) return null;
+  const o: Record<string, string> = { pg_code: e.code };
+  if (e.constraint) o.pg_constraint = e.constraint;
+  if (e.table) o.pg_table = e.table;
+  return o;
+}
+
+// ── Stack parsing ───────────────────────────────────────────────────────────
+interface Frame { filename?: string; function?: string; lineno?: number; colno?: number; in_app?: boolean }
+const FRAME_RE = /^\s*at\s+(?:(.+?)\s+\()?(?:(.+?):(\d+):(\d+)|(.+?))\)?\s*$/;
+export function parseStack(stack: string | undefined): Frame[] {
+  if (!stack) return [];
+  const frames: Frame[] = [];
+  for (const line of stack.split("\n").slice(0, 60)) {
+    const m = FRAME_RE.exec(line);
+    if (!m) continue;
+    const file = (m[2] ?? m[5] ?? "").replace(/^webpack-internal:\/\/\/(?:\(rsc\)|\(ssr\)|\(app-pages-browser\))?\/?/, "").replace(/^file:\/\//, "").replace(/\?.*$/, "");
+    const f: Frame = { filename: file || undefined, function: m[1]?.trim() || undefined };
+    if (m[3]) { f.lineno = Number(m[3]); f.colno = Number(m[4]); }
+    f.in_app = !!file && !/node_modules|^node:|^internal\/|\.next\/server\/chunks|<anonymous>/.test(file);
+    frames.push(f);
+  }
+  return frames.reverse(); // oldest call first, as the hub expects
+}
+
+function describe(err: unknown): { type: string; value: string; frames: Frame[]; extra: Record<string, string> | null } {
+  if (err instanceof Error) {
+    return { type: err.name || err.constructor?.name || "Error", value: scrub(err.message ?? ""), frames: parseStack(err.stack), extra: pgBits(err) };
+  }
+  if (typeof err === "string") return { type: "Error", value: scrub(err), frames: [], extra: null };
+  return { type: "Error", value: scrub(String(err)).slice(0, 300), frames: [], extra: null };
+}
+
+// ── Queue, dedupe, config poll ──────────────────────────────────────────────
+interface Outgoing {
+  event_id: string; occurred_at: string; level: Level; environment: string; release: string; platform: string; source: string; instance: string;
+  count: number; exception: { values: { type: string; value: string; stacktrace: { frames: Frame[] } }[] };
+  request?: { method?: string; route?: string; route_type?: string; status?: number };
+  user: { id: string; role: string } | null; runtime?: Record<string, string | null>; tags?: Record<string, string | number | boolean>; fingerprint?: string;
+}
+const queue: Outgoing[] = [];
+const MAX_QUEUE = 200;
+const recent = new Map<string, { at: number; ev: Outgoing }>(); // same error within 60 s → one event, count n
+let config: { enabled: boolean; sample_rate: number; min_level: Level; fetched: number } = { enabled: true, sample_rate: 1, min_level: "warning", fetched: 0 };
+let flushTimer: NodeJS.Timeout | null = null;
+let inFlight = false;
+export const stats = { sent: 0, dropped: 0, lastError: null as string | null, lastAt: null as string | null };
+const RANK: Record<Level, number> = { fatal: 3, error: 2, warning: 1 };
+
+export function reportingConfigured(): boolean { return !!KEY() && !KILL(); }
+
+async function refreshConfig(): Promise<void> {
+  if (!reportingConfigured() || Date.now() - config.fetched < 5 * 60_000) return;
+  config.fetched = Date.now(); // even on failure: don't hammer a hub that is down
+  try {
+    const res = await fetch(`${HUB()}/api/v1/errors/config`, { headers: { authorization: `Bearer ${KEY()}` }, signal: AbortSignal.timeout(3000), cache: "no-store" });
+    if (!res.ok) return;
+    const j = (await res.json()) as { enabled?: boolean; sample_rate?: number; min_level?: Level };
+    config = { enabled: j.enabled !== false, sample_rate: typeof j.sample_rate === "number" ? j.sample_rate : 1, min_level: j.min_level ?? "warning", fetched: Date.now() };
+  } catch { /* keep the last answer */ }
+}
+
+async function flush(): Promise<void> {
+  flushTimer = null;
+  if (inFlight || !queue.length || !reportingConfigured()) return;
+  await refreshConfig();
+  if (!config.enabled) { stats.dropped += queue.length; queue.length = 0; return; }
+  inFlight = true;
+  const batch = queue.splice(0, 20);
+  try {
+    const res = await fetch(`${HUB()}/api/v1/errors`, {
+      method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${KEY()}` },
+      body: JSON.stringify({ events: batch }), signal: AbortSignal.timeout(2500),
+    });
+    const j = (await res.json().catch(() => ({}))) as { accepted?: number; disabled?: boolean };
+    if (j.disabled) config = { ...config, enabled: false, fetched: Date.now() };
+    if (res.ok) { stats.sent += j.accepted ?? batch.length; stats.lastAt = new Date().toISOString(); stats.lastError = null; }
+    else { stats.dropped += batch.length; stats.lastError = `HTTP ${res.status}`; }
+  } catch (e) {
+    stats.dropped += batch.length;
+    stats.lastError = (e as Error).message;
+  } finally {
+    inFlight = false;
+    if (queue.length) schedule(50);
+  }
+}
+function schedule(ms = 500) { if (!flushTimer) flushTimer = setTimeout(() => { flush().catch(() => {}); }, ms).unref?.() ?? null; }
+
+function enqueue(ev: Outgoing): void {
+  if (!reportingConfigured() || !config.enabled) { stats.dropped++; return; }
+  if (RANK[ev.level] < RANK[config.min_level]) return;
+  if (config.sample_rate < 1 && Math.random() > config.sample_rate) return;
+  const key = `${ev.exception.values[0]?.type}|${ev.exception.values[0]?.value.slice(0, 120)}|${ev.request?.route ?? ""}`;
+  const seen = recent.get(key);
+  if (seen && Date.now() - seen.at < 60_000) { seen.ev.count++; return; }
+  recent.set(key, { at: Date.now(), ev });
+  if (recent.size > 500) for (const [k, v] of recent) if (Date.now() - v.at > 60_000) recent.delete(k);
+  if (queue.length >= MAX_QUEUE) { queue.shift(); stats.dropped++; }
+  queue.push(ev);
+  schedule();
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
+export function captureException(err: unknown, ctx: Ctx = {}): void {
+  try {
+    if (isExpected(err)) return;
+    const d = describe(err);
+    const cause = (err as { cause?: unknown })?.cause;
+    const values = [{ type: d.type, value: d.value, stacktrace: { frames: d.frames } }];
+    if (cause && cause !== err) { const c = describe(cause); values.push({ type: c.type, value: c.value, stacktrace: { frames: c.frames } }); }
+    const ev: Outgoing = {
+      event_id: crypto.randomUUID(), occurred_at: new Date().toISOString(), level: ctx.level ?? "error", environment: ENV(), release: RELEASE,
+      platform: ctx.platform ?? "node", source: ctx.source ?? "server", instance: INSTANCE(), count: 1,
+      exception: { values },
+      request: ctx.route || ctx.method ? { method: ctx.method, route: ctx.route ?? undefined, route_type: ctx.routeType, status: ctx.status } : undefined,
+      user: ctx.user ?? null,
+      runtime: { node: process.version, ...(ctx.runtime ?? {}) },
+      tags: { ...(d.extra ?? {}), ...(ctx.tags ?? {}) },
+      fingerprint: ctx.fingerprint,
+    };
+    enqueue(ev);
+  } catch { /* never */ }
+}
+
+export function captureMessage(message: string, level: Level = "warning", ctx: Ctx = {}): void {
+  captureException(Object.assign(new Error(message), { name: "Message" }), { level, ...ctx, fingerprint: ctx.fingerprint ?? `msg:${message.slice(0, 80)}` });
+}
+
+// A report the browser sent (app/error.tsx, window.onerror); /api/errors has
+// already checked the session and rate limit. Only these fields are taken.
+export function captureFromBrowser(raw: Record<string, unknown>, user: { id: string; role: string } | null): void {
+  try {
+    const str = (v: unknown, n: number) => (typeof v === "string" ? v.slice(0, n) : "");
+    const type = str(raw.name, 80) || "Error";
+    const message = scrub(str(raw.message, 1000));
+    const stack = str(raw.stack, 6000);
+    const digest = str(raw.digest, 80);
+    const route = str(raw.route, 200);
+    const level: Level = type === "ChunkLoadError" || /Loading chunk|Failed to fetch dynamically imported module/.test(message) ? "warning" : "error";
+    const err = Object.assign(new Error(message), { name: type, stack: stack || undefined });
+    captureException(err, {
+      level, platform: "browser", source: user ? "client" : "public", route: route ? scrub(route) : null, routeType: str(raw.kind, 20) || "browser", user,
+      runtime: { node: null, browser: str(raw.ua, 160) || null, viewport: str(raw.viewport, 20) || null },
+      tags: digest ? { digest } : {},
+    });
+  } catch { /* never */ }
+}
+
+// Flush what is queued before the process goes (deploys restart the container).
+export function flushNow(): Promise<void> { return flush().catch(() => {}); }

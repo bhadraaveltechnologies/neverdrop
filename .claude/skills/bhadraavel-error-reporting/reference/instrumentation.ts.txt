@@ -1,0 +1,30 @@
+// Runs once per server process (Node runtime only). Starts the reminder loop
+// and hooks error reporting to the Bhadraavel support hub (src/lib/errors.ts).
+import type { Instrumentation } from "next";
+
+export async function register() {
+  if (process.env.NEXT_RUNTIME === "nodejs") {
+    const { startJobLoop } = await import("./lib/jobs");
+    startJobLoop();
+    const { captureException, flushNow } = await import("./lib/errors");
+    // Failures outside any request: a promise nobody awaited, a throw in a timer.
+    process.on("unhandledRejection", (reason) => captureException(reason, { source: "server", level: "error", tags: { origin: "unhandledRejection" } }));
+    process.on("uncaughtException", (err) => { captureException(err, { source: "server", level: "fatal", tags: { origin: "uncaughtException" } }); console.error("[uncaught]", err); });
+    for (const sig of ["SIGTERM", "SIGINT"] as const) process.once(sig, () => { flushNow().finally(() => process.exit(0)); });
+  }
+}
+
+// Every uncaught failure in a page, layout, server component, server action,
+// route handler or middleware passes through here, with the route TEMPLATE
+// (never the real path) and what kind of thing was running.
+export const onRequestError: Instrumentation.onRequestError = async (err, request, context) => {
+  if (process.env.NEXT_RUNTIME !== "nodejs") return;
+  const { captureException } = await import("./lib/errors");
+  captureException(err, {
+    source: "server",
+    route: context.routePath,
+    routeType: `${context.routerKind} ${context.routeType}`.toLowerCase(),
+    method: request.method,
+    tags: { render: context.renderSource ?? "", revalidate: context.revalidateReason ?? "" },
+  });
+};

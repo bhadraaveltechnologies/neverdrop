@@ -1,0 +1,28 @@
+"use client";
+
+import { useEffect } from "react";
+import { reportToServer } from "@/components/ErrorListener";
+
+// Shown when a page fails on our side. Gentle, no blame, a way forward — and
+// the short reference the desk can match to the report the server already
+// made. Reported from here too, so a failure in the browser's render (which
+// the server never sees) still reaches the hub.
+export default function ErrorPage({ error, reset }: { error: Error & { digest?: string }; reset: () => void }) {
+  useEffect(() => { reportToServer({ name: error.name, message: error.message, stack: error.stack, digest: error.digest, kind: "error.tsx" }); }, [error]);
+  const ref = error.digest ? error.digest.slice(0, 10) : null;
+  return (
+    <main className="narrow stack" style={{ paddingTop: 48 }}>
+      <h1>Sorry — something went wrong on our side</h1>
+      <p className="muted">
+        It isn&apos;t anything you did. We have been told about it automatically, and nothing you saved has been lost.
+        Please try again in a moment; if it keeps happening, do let us know.
+      </p>
+      <p className="row" style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <button type="button" className="btn btn-primary" onClick={reset}>Try again</button>
+        <a className="btn btn-secondary" href="/">Go to the start</a>
+        <a className="btn btn-secondary" href={`/help${ref ? `?ref=${encodeURIComponent(ref)}` : ""}`}>Get help</a>
+      </p>
+      {ref && <p className="muted" style={{ fontSize: 13 }}>Reference for the support team: <code>{ref}</code></p>}
+    </main>
+  );
+}
