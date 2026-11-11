@@ -1,0 +1,50 @@
+// In the skill this is errors.test.ts.txt; scripts/test-references.sh in the
+// SkillFactory copies it out as errors.test.ts and runs it with `node --test`.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { scrub, parseStack, isExpected, expected, captureException, stats } from "./errors.ts";
+
+test("scrub removes phones, emails, codes, tokens, signed links, query strings and bill numbers", () => {
+  assert.equal(scrub("call +91 98765 43210 or 9876543210"), "call [phone] or [phone]");
+  assert.equal(scrub("mail a.b@example.com"), "mail [email]");
+  assert.equal(scrub("code 123456 sent"), "code [code] sent");
+  assert.equal(scrub("Authorization: Bearer abcdefghijklmnopqrstuvwxyz"), "Authorization: [token]");
+  assert.equal(scrub("key sh_vijaya_0123456789abcdef"), "key [token]");
+  assert.equal(scrub("open /a/AbCdEfGhIjKlMnOpQrStUv now"), "open /a/[token] now");
+  assert.equal(scrub("GET https://x.test/p?phone=1&x=2 done"), "GET https://x.test/p?[query] done");
+  assert.equal(scrub("bill VO/26-27/000123"), "bill [bill-no]");
+  // Dates, times and small numbers stay: they are what makes a message readable.
+  assert.equal(scrub("slot 14:30 on 2026-11-05 for staff 7"), "slot 14:30 on 2026-11-05 for staff 7");
+});
+
+test("parseStack reads V8 frames oldest-first and marks in-app ones", () => {
+  const stack = [
+    "TypeError: Cannot read properties of undefined (reading 'roles')",
+    "    at requireUser (webpack-internal:///(rsc)/./src/lib/auth.ts:56:12)",
+    "    at async Page (webpack-internal:///(rsc)/./src/app/desk/page.tsx:10:3)",
+    "    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)",
+  ].join("\n");
+  const frames = parseStack(stack);
+  assert.equal(frames.length, 3);
+  assert.deepEqual(frames[2], { filename: "./src/lib/auth.ts", function: "requireUser", lineno: 56, colno: 12, in_app: true });
+  assert.equal(frames[0].in_app, false);
+});
+
+test("expected failures are not reported", () => {
+  class SlotTaken extends Error {}
+  assert.equal(isExpected(new SlotTaken("taken")), true);
+  assert.equal(isExpected(Object.assign(new Error("x"), { digest: "NEXT_REDIRECT;replace;/login" })), true);
+  assert.equal(isExpected(expected(new Error("validation"))), true);
+  assert.equal(isExpected(new TypeError("real bug")), false);
+  assert.equal(isExpected("a string"), false);
+});
+
+test("captureException never throws, and drops quietly when no key is configured", () => {
+  delete process.env.SUPPORT_HUB_KEY;
+  const before = stats.dropped;
+  captureException(new Error("anything"), { route: "/x" });
+  captureException(null);
+  captureException({ weird: true } as unknown);
+  assert.equal(stats.dropped, before + 3);
+  assert.equal(stats.sent, 0);
+});

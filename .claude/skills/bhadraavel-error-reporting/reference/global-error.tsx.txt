@@ -1,0 +1,25 @@
+"use client";
+
+import { useEffect } from "react";
+import { reportToServer } from "@/components/ErrorListener";
+
+// The last resort: the root layout itself failed, so this page brings its own
+// <html>. Plain styling on purpose — globals.css may be the thing that broke.
+export default function GlobalError({ error, reset }: { error: Error & { digest?: string }; reset: () => void }) {
+  useEffect(() => { reportToServer({ name: error.name, message: error.message, stack: error.stack, digest: error.digest, kind: "global-error.tsx" }); }, [error]);
+  const ref = error.digest ? error.digest.slice(0, 10) : null;
+  return (
+    <html lang="en">
+      <body style={{ fontFamily: "system-ui, sans-serif", maxWidth: 560, margin: "48px auto", padding: "0 16px", lineHeight: 1.5, color: "#1c2733" }}>
+        <h1 style={{ fontSize: 22 }}>Sorry — something went wrong on our side</h1>
+        <p style={{ color: "#5b6b7a" }}>It isn&apos;t anything you did. We have been told about it automatically. Please try again in a moment.</p>
+        <p style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <button type="button" onClick={reset} style={{ padding: "8px 16px", borderRadius: 8, border: "1px solid #0F6B5C", background: "#0F6B5C", color: "#fff", cursor: "pointer" }}>Try again</button>
+          <a href="/" style={{ padding: "8px 16px", borderRadius: 8, border: "1px solid #d7dee5", color: "#1c2733", textDecoration: "none" }}>Go to the start</a>
+          <a href={`/help${ref ? `?ref=${encodeURIComponent(ref)}` : ""}`} style={{ padding: "8px 16px", borderRadius: 8, border: "1px solid #d7dee5", color: "#1c2733", textDecoration: "none" }}>Get help</a>
+        </p>
+        {ref && <p style={{ color: "#5b6b7a", fontSize: 13 }}>Reference for the support team: <code>{ref}</code></p>}
+      </body>
+    </html>
+  );
+}
