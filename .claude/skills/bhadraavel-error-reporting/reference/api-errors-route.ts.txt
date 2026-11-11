@@ -1,0 +1,19 @@
+import { currentUser } from "@/lib/auth";
+import { body, clientIp, limited } from "@/lib/http";
+import { captureFromBrowser } from "@/lib/errors";
+
+// The browser's way to the error bus: app/error.tsx and the window listeners
+// post here. The hub key stays on the server; the signed-in staff member (id
+// and role, never a patient) is added from the session. Always 204 — an error
+// about reporting an error helps nobody.
+export const dynamic = "force-dynamic";
+
+export async function POST(req: Request) {
+  if (limited(`errors:${clientIp(req)}`, 30, 60_000)) return new Response(null, { status: 204 });
+  const me = await currentUser().catch(() => null);
+  const b = await body(req);
+  if (typeof b.message === "string" || typeof b.name === "string") {
+    captureFromBrowser(b, me ? { id: me.kind === "staff" ? `staff:${me.id}` : "operator", role: me.roles[0] ?? me.kind } : null);
+  }
+  return new Response(null, { status: 204 });
+}

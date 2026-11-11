@@ -1,6 +1,6 @@
 ---
 name: bhadraavel-footer
-description: Build or fix the standard Bhadraavel Technologies footer in any of the user's apps - the "Crafted by Bhadraavel Technologies LLP" line framed by the trishul (left) and the vel (right), a copyright with the current year, the app's version, and nothing else about the app. Use whenever the user asks for a footer, the maker's line, the trishul and vel marks, or says an app's footer is missing or wrong.
+description: Build or fix the standard Bhadraavel Technologies footer in any of the user's apps - the "Crafted by Bhadraavel Technologies LLP" line framed by the trishul (left, red sash) and the vel (right, Murugan-green sash), a copyright with the current year, the app's version, and nothing else about the app. Use whenever the user asks for a footer, the maker's line, the trishul and vel marks, or says an app's footer is missing or wrong.
 ---
 
 # The Bhadraavel footer
@@ -28,6 +28,12 @@ footer can be built in any stack without asking.
   sash**: a cloth tied to the shaft just behind the head, draped along the
   shaft and trailing below it towards the butt. The trishul's sash is the
   vel's mirrored, so the two match.
+- (11 November 2026) "The cloth used for the vel is **green** in colour,
+  and the cloth used in the trishul is **red** in colour." The green is the
+  green Murugan devotees wear (*pachai*, the deep leaf green of their veshtis
+  and kavadi cloth), not a lime or a teal; the red is kumkum red. Only the
+  two sashes are coloured; the rest of each mark stays in the muted text
+  colour.
 - "Make sure that we do not have any other text or verbiage related to that
   application beyond the footer information. Anything we need to have should
   be just about that." No tagline, no description of the app, no notes about
@@ -37,7 +43,7 @@ footer can be built in any stack without asking.
 
 ## The footer, top to bottom
 
-1. **Maker's line**: trishul, then "Crafted by [Bhadraavel Technologies LLP](https://www.bhadraaveltechnologies.com)." then vel. The link opens in a new tab. The marks are in the muted text colour, about 18 to 20 px tall, flex-centred on the same line with 12 px gaps, and hidden below about 420 px wide so the text never wraps around them.
+1. **Maker's line**: trishul, then "Crafted by [Bhadraavel Technologies LLP](https://www.bhadraaveltechnologies.com)." then vel. The link opens in a new tab. The marks are in the muted text colour (their sashes green on the vel, red on the trishul), about 18 to 20 px tall, flex-centred on the same line with 12 px gaps, and hidden below about 420 px wide so the text never wraps around them.
 2. **Links** to the pages about the app, if the app has them, in this order when present: What's new · Privacy · Terms · Refunds · Help (or Contact). Nothing else. Every link must work for a
    signed-out visitor too: Help must open a page that files a request
    without a sign-in, since a person who cannot sign in needs it most.
@@ -55,21 +61,34 @@ short rule or thin top border above it, bottom padding that respects
 ## The marks
 
 Both are solid silhouettes in `currentColor`, 120 x 40 viewBox, drawn so
-they lie flat. Each is drawn pointing one way; the `<g>` mirror below turns
+they lie flat, except the sash: the vel's sash is Murugan green and the
+trishul's is kumkum red, each a path with its own class and fill. Each is drawn pointing one way; the `<g>` mirror below turns
 it to point **in**, towards the text: the trishul on the left points right,
 the vel on the right points left. Keep `aria-hidden`: they decorate the line.
 
 Trishul (left of the text; drawn pointing left, mirrored to point right):
 
 ```html
-<svg aria-hidden="true" viewBox="0 0 120 40" height="18" width="54" fill="currentColor"><g transform="translate(120 0) scale(-1 1)"><path d="M2 20c12-3.2 26-3.6 40-3.6v7.2c-14 0-28-0.4-40-3.6z"/><path d="M44 20c-2-10-8-16-18-17c-8-0.8-16 0.4-22 5c9-2.6 17-2.4 23-0.4c7 2.4 12 6 14 12.4z"/><path d="M44 20c-2 10-8 16-18 17c-8 0.8-16-0.4-22-5c9 2.6 17 2.4 23 0.4c7-2.4 12-6 14-12.4z"/><circle cx="46" cy="20" r="4.2"/><path d="M49 18.6h68a1.4 1.4 0 0 1 0 2.8H49z"/><path d="M52 21c5 7 11 12 22 13c7 0.6 12-2 15-6c-6 2.6-12 2-18-1.2c-6.6-3.4-11-6.4-15-10.4c-1 1.2-2.4 2.8-4 4.6z"/><path d="M100 16.5h2v7h-2zM104 16.5h2v7h-2z"/></g></svg>
+<svg aria-hidden="true" viewBox="0 0 120 40" height="18" width="54" fill="currentColor"><g transform="translate(120 0) scale(-1 1)"><path d="M2 20c12-3.2 26-3.6 40-3.6v7.2c-14 0-28-0.4-40-3.6z"/><path d="M44 20c-2-10-8-16-18-17c-8-0.8-16 0.4-22 5c9-2.6 17-2.4 23-0.4c7 2.4 12 6 14 12.4z"/><path d="M44 20c-2 10-8 16-18 17c-8 0.8-16-0.4-22-5c9 2.6 17 2.4 23 0.4c7-2.4 12-6 14-12.4z"/><circle cx="46" cy="20" r="4.2"/><path d="M49 18.6h68a1.4 1.4 0 0 1 0 2.8H49z"/><path class="sash-trishul" fill="#C8102E" d="M52 21c5 7 11 12 22 13c7 0.6 12-2 15-6c-6 2.6-12 2-18-1.2c-6.6-3.4-11-6.4-15-10.4c-1 1.2-2.4 2.8-4 4.6z"/><path d="M100 16.5h2v7h-2zM104 16.5h2v7h-2z"/></g></svg>
 ```
 
 Vel (right of the text; drawn pointing right, mirrored to point left):
 
 ```html
-<svg aria-hidden="true" viewBox="0 0 120 40" height="18" width="54" fill="currentColor"><g transform="translate(120 0) scale(-1 1)"><circle cx="3.5" cy="20" r="2.6"/><path d="M5 18.6h63v2.8H5z"/><path d="M48 21c-5 7-11 12-22 13c-7 0.6-12-2-15-6c6 2.6 12 2 18-1.2c6.6-3.4 11-6.4 15-10.4c1 1.2 2.4 2.8 4 4.6z"/><path d="M66 14.5h5a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5h-5a1.5 1.5 0 0 1-1.5-1.5v-8a1.5 1.5 0 0 1 1.5-1.5z"/><path d="M72.5 18c0-5 3-9 8-12c-2 4-2.5 7.5-1 11c-2.5-0.4-4.8-0.2-7 1z"/><path d="M72.5 22c0 5 3 9 8 12c-2-4-2.5-7.5-1-11c-2.5 0.4-4.8 0.2-7-1z"/><path d="M79 20c-1.5-9 5.5-16 15-16c10 0 18 8 24 16c-6 8-14 16-24 16c-9.5 0-16.5-7-15-16z"/></g></svg>
+<svg aria-hidden="true" viewBox="0 0 120 40" height="18" width="54" fill="currentColor"><g transform="translate(120 0) scale(-1 1)"><circle cx="3.5" cy="20" r="2.6"/><path d="M5 18.6h63v2.8H5z"/><path class="sash-vel" fill="#0E8A3E" d="M48 21c-5 7-11 12-22 13c-7 0.6-12-2-15-6c6 2.6 12 2 18-1.2c6.6-3.4 11-6.4 15-10.4c1 1.2 2.4 2.8 4 4.6z"/><path d="M66 14.5h5a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5h-5a1.5 1.5 0 0 1-1.5-1.5v-8a1.5 1.5 0 0 1 1.5-1.5z"/><path d="M72.5 18c0-5 3-9 8-12c-2 4-2.5 7.5-1 11c-2.5-0.4-4.8-0.2-7 1z"/><path d="M72.5 22c0 5 3 9 8 12c-2-4-2.5-7.5-1-11c-2.5 0.4-4.8 0.2-7-1z"/><path d="M79 20c-1.5-9 5.5-16 15-16c10 0 18 8 24 16c-6 8-14 16-24 16c-9.5 0-16.5-7-15-16z"/></g></svg>
 ```
+
+The sash colours:
+
+| Sash | Light background | Dark background | CSS variable |
+|---|---|---|---|
+| Vel: Murugan green (*pachai*) | `#0E8A3E` | `#2FB45A` | `--sash-vel` |
+| Trishul: kumkum red | `#C8102E` | `#E5394A` | `--sash-trishul` |
+
+The `fill` attribute on the path is the fallback (an email, a share image,
+anywhere without the stylesheet); the CSS below sets the colour from the
+variable, so a dark theme only redefines the two variables. Never colour
+the whole mark, never swap the colours, never put the sash in `currentColor`.
 
 In a React app keep the two as components (`Trishul`, `Vel`) with
 `className` and `height` props and width `height * 3`; the path data is the
@@ -91,6 +110,8 @@ same.
 .site-footer p { margin: 0; }
 .footer-maker { display: flex; align-items: center; justify-content: center; gap: 12px; color: var(--ink); }
 .footer-maker svg { flex-shrink: 0; color: var(--muted); }
+.footer-maker .sash-vel { fill: var(--sash-vel, #0E8A3E); }
+.footer-maker .sash-trishul { fill: var(--sash-trishul, #C8102E); }
 .footer-maker a { color: var(--accent); text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 4px; }
 .footer-nav { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 20px; margin-top: 14px; }
 .footer-nav a { color: var(--muted); text-decoration: none; }
@@ -100,7 +121,10 @@ same.
 @media print { .site-footer { display: none !important; } }
 ```
 
-Use the app's own colour tokens for ink, muted, border and accent.
+Use the app's own colour tokens for ink, muted, border and accent. For a
+dark theme set `--sash-vel: #2FB45A; --sash-trishul: #E5394A;` wherever the
+theme's other tokens are redefined (both `prefers-color-scheme: dark` and an
+explicit dark theme switch, if the app has one).
 
 ## How to apply it
 
@@ -112,9 +136,12 @@ Use the app's own colour tokens for ink, muted, border and accent.
    year from the clock.
 3. Remove any app-specific sentence from the footer (see the rules above).
 4. Check the order: trishul, text, vel. Check the spelling: Bhadraavel.
+   Check the colours: green sash on the vel, red sash on the trishul, in
+   light and dark themes.
 5. Open the page at desktop and phone widths and look at the footer; add or
    update a test that the maker's line and the version appear on every page.
 
-Known implementations, both matching this skill as of 28 October 2026:
+Known implementations, both matching this skill as of 28 October 2026
+(before the coloured sashes; update them to the 11 November rule):
 Panchangam (`src/site.js`, `footerHtml`) and Memorize It
 (`components/footer.tsx` with `components/crest.tsx`).
