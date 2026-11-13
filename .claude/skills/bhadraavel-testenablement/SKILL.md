@@ -61,6 +61,8 @@ The pilot is **myclinicapp's pharmacy module** (13 November 2026):
 tests/e2e/<feature>.mjs            the suite (one per feature or module)
 tests/e2e/lib/test-results.mjs     from reference/
 tests/e2e/lib/browser.mjs          from reference/
+tests/e2e/lib/<app>.mjs            the app's own: test accounts, sign-in, clean start (once there is more than one suite)
+tests/e2e/start-local.sh           starts the built app the way the suites expect
 test-results/
   README.md                        index: one row per day
   <MMDDYYYY>/
@@ -188,10 +190,56 @@ suite side by side. myclinicapp's `tests/e2e/checks.mjs` is the example.
   stop when the container idles: start both and check the health address
   before every run.
 
+Learned when every remaining feature of myclinicapp got a suite (six more,
+the same day):
+
+- **A failing scenario may be the app.** Two of those six suites failed on
+  real faults: cancelled appointments missing from the desk's list (a NULL
+  note failed a `NOT LIKE` test), and a false "opened upload" line in the
+  record trail. Before touching the scenario, find out which side is
+  wrong; fix the app in the same change and say so in the report.
+- **A page that never goes quiet.** If `networkidle` hangs, list the
+  requests still open. There it was a Next `<Link>` to a file route
+  (`/uploads/<id>`): the background prefetch asked for the file, never
+  finished, and wrote an audit entry nobody caused. Links to files and
+  downloads are plain `<a href target="_blank">`, never `<Link>`.
+- **The sign-in limit per address.** Besides the per-phone limit, the apps
+  allow about ten sign-in requests per client address every ten minutes,
+  kept in memory. A day of suites from one machine trips it. Give each
+  test browser its own address (`extraHTTPHeaders: { "x-forwarded-for":
+  "10.x.y.z" }` on the context), as real people behind the proxy have.
+  Never raise or switch off the limit for the tests.
+- **Sign each role in once.** Keep one page per role for the whole suite
+  (`as("desk")`, `as("doctor")`) instead of signing in per scenario: fewer
+  codes used, and a much faster run.
+- **Suites share one database.** Each passed alone; run one after another,
+  the appointments suite failed because tokens the visits suite left
+  waiting pushed its own off the waiting-room screen. A suite clears what
+  it depends on at its start (its own made-up people by phone, and
+  anything waiting today in the queue it reads), and leaves the plan and
+  settings as the other suites expect when it finishes. **Run every suite
+  in one go on the final build before reporting**, not only the new one.
+- **Know the test accounts.** "A doctor cannot open this page" failed
+  because the seeded doctor was also the clinic admin, who may. Read the
+  roles of the account before writing a who-can-do-what scenario, and use
+  one with only the role being tested.
+- **A rebuild breaks the running app.** `next build` (which the checks
+  suite runs) clears the standalone copy's static files; pages still load
+  but nothing on them works, so every suite then dies at sign-in with no
+  error on screen. Copy `.next/static` and `public` back and restart.
+  Start the app with its public address set to the address the suites
+  use, or the links in patients' messages point at a port nobody listens
+  on. Keep both in one start script (myclinicapp's
+  `tests/e2e/start-local.sh`) rather than a remembered command.
+- **Two elements for one selector.** A layout class can match twice on
+  some pages (`.wrap`); take the one meant (`.last()`), or select by
+  something only that block has.
+
 ## 6. Running, and what to hand over
 
 ```bash
 # the app, built, on :3300, with codes on screen and no support-hub key
+bash tests/e2e/start-local.sh   # again after every build
 NODE_PATH=$(npm root -g) node --import tsx tests/e2e/<feature>.mjs
 ```
 
@@ -229,6 +277,7 @@ Then:
 - [ ] Off/on, main path, every refusal, unchanged-after, document, roles, books-balance
 - [ ] Numbers checked against the rule computed independently
 - [ ] Screenshots read by you, not only the pass count
+- [ ] Every suite of the app run in one go on the final build
 - [ ] "Not covered by this run" filled in honestly
 - [ ] `test-results` in `.dockerignore`; `tests/e2e` outside the unit-test glob
 - [ ] Results committed; pull request quotes them; README has the section
