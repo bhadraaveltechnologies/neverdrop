@@ -1,0 +1,197 @@
+// The test-results writer (bhadraavel-testenablement). No dependencies.
+// Copy as tests/e2e/lib/test-results.mjs.
+//
+// A suite calls createRun(), runs scenarios through run.test(), then
+// run.finish(). That writes, under <root>/test-results/<MMDDYYYY>/:
+//   <suite-key>.md          the report: every scenario with what was done,
+//                           what was expected, what happened, and its screenshot
+//   <suite-key>/*.png       the screenshots (cleared at the start of each run)
+//   README.md               what was tested that day; rewritten on every run
+//   runs.json               the day's state, so a second run the same day
+//                           updates the README instead of replacing it
+// and <root>/test-results/README.md, the index of days.
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+/** Parts of a moment in a timezone: { folder: "11132026", day: "13 November 2026", time: "17:46 IST" }. */
+export function dayParts(now = new Date(), timeZone = "Asia/Kolkata", zoneLabel = "IST") {
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone, day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(now).map((x) => [x.type, x.value]));
+  return {
+    folder: `${p.month}${p.day}${p.year}`, // MMDDYYYY, as the owner asked
+    day: new Intl.DateTimeFormat("en-GB", { timeZone, day: "numeric", month: "long", year: "numeric" }).format(now),
+    time: `${p.hour === "24" ? "00" : p.hour}:${p.minute} ${zoneLabel}`,
+  };
+}
+
+/** MMDDYYYY folders, newest day first (sorted as dates, not as text: 01052027 comes after 12312026). */
+export function sortDayFolders(names) {
+  const key = (x) => x.slice(4) + x.slice(0, 4);
+  return names.filter((x) => /^\d{8}$/.test(x)).sort((a, b) => key(b).localeCompare(key(a)));
+}
+
+export function slug(id, title) {
+  return `${id.toLowerCase()}-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48)}.png`;
+}
+
+const mark = (pass) => (pass ? "✅ Pass" : "❌ Fail");
+const cell = (s) => String(s ?? "").replace(/\|/g, "\\|").replace(/\n+/g, " ");
+
+/**
+ * The report for one suite. `run`: { suite: {key, name}, day, time, commit,
+ * intro, results: [{id, area, title, did, expected, actual, pass, shot}],
+ * unit: [{name, pass}], unitSource, notCovered: [..], rerun }.
+ */
+export function renderReport(run) {
+  const { results, unit = [] } = run;
+  const passed = results.filter((r) => r.pass).length;
+  const failed = results.length - passed;
+  const unitPassed = unit.filter((u) => u.pass).length;
+  const areas = [...new Set(results.map((r) => r.area))];
+  const md = [`# ${run.suite.name}: test results`, ""];
+  md.push(`**${run.day}, ${run.time}** · code at commit \`${run.commit}\` · ${run.intro ?? "run in a real browser (Chromium) against a local copy of the app with test data."}`, "");
+  md.push("| | Scenarios | Passed | Failed |", "|---|---|---|---|", `| In the browser, with a screenshot each | ${results.length} | ${passed} | ${failed} |`);
+  if (unit.length) md.push(`| Rules, unit-tested${run.unitSource ? ` (\`${run.unitSource}\`)` : ""} | ${unit.length} | ${unitPassed} | ${unit.length - unitPassed} |`);
+  md.push("", failed === 0 && unitPassed === unit.length ? "**Everything passed.**" : `**${failed + (unit.length - unitPassed)} did not pass.** They are marked ❌ below.`, "");
+  md.push("## How to read this", "", "Each scenario says what was done, what should happen, and what did happen, with a screenshot taken at that moment. All people, records and numbers shown are made-up test data.", "");
+  md.push("## Summary", "", "| # | Area | Scenario | Result |", "|---|---|---|---|");
+  for (const r of results) md.push(`| [${r.id}](#${r.id.toLowerCase()}) | ${cell(r.area)} | ${cell(r.title)} | ${mark(r.pass)} |`);
+  md.push("");
+  for (const a of areas) {
+    md.push(`## ${a}`, "");
+    for (const r of results.filter((x) => x.area === a)) {
+      md.push(`<a id="${r.id.toLowerCase()}"></a>`, "", `### ${r.id} · ${r.title} ${r.pass ? "✅" : "❌"}`, "");
+      md.push(`- **What was done:** ${r.did}`, `- **Expected:** ${r.expected}`, `- **What happened:** ${r.actual}`, `- **Result:** ${r.pass ? "Pass" : "Fail"}`, "");
+      md.push(r.shot ? `![${r.id}: ${r.title}](${run.suite.key}/${r.shot})` : "_No screenshot: this check reads the data directly._", "");
+    }
+  }
+  if (unit.length) {
+    md.push("## The rules, unit-tested", "", "These run without a browser or database and check the arithmetic and rules on their own.", "", "| Rule | Result |", "|---|---|");
+    for (const u of unit) md.push(`| ${cell(u.name)} | ${mark(u.pass)} |`);
+    md.push("");
+  }
+  if (run.notCovered?.length) md.push("## Not covered by this run", "", ...run.notCovered.map((x) => `- ${x}`), "");
+  if (run.rerun) md.push("## Running it again", "", "```", run.rerun, "```", "");
+  return md.join("\n");
+}
+
+/** Adds this run to the day's state: the suite's entry is replaced, the run is appended to the log. */
+export function mergeDayState(state, run) {
+  const s = state ?? { suites: {}, runs: [] };
+  const { results, unit = [] } = run;
+  const passed = results.filter((r) => r.pass).length;
+  const unitPassed = unit.filter((u) => u.pass).length;
+  const areas = [...new Set(results.map((r) => r.area))];
+  const summary = { name: run.suite.name, commit: run.commit, scenarios: results.length, passed, failed: results.length - passed, unit: unit.length, unitPassed };
+  return {
+    suites: {
+      ...s.suites,
+      [run.suite.key]: { ...summary, report: `${run.suite.key}.md`, lastRun: run.time, covered: areas.map((a) => ({ area: a, tests: results.filter((r) => r.area === a).map((r) => ({ id: r.id, title: r.title, pass: r.pass })) })) },
+    },
+    runs: [...s.runs, { time: run.time, suite: run.suite.name, ...summary }],
+  };
+}
+
+/** The day's README: what was tested today (latest run of each suite), the tests covered, and every run. */
+export function renderDayReadme(state, day) {
+  const md = [`# Test results: ${day}`, "", "What was tested today, and how it went. This file is rewritten every time a test suite runs today; the run log at the bottom keeps every run.", ""];
+  md.push("## Tested today", "", "| Suite | Scenarios | Passed | Failed | Unit tests | Last run | Report |", "|---|---|---|---|---|---|---|");
+  for (const s of Object.values(state.suites)) md.push(`| ${cell(s.name)} | ${s.scenarios} | ${s.passed} | ${s.failed} | ${s.unit ? `${s.unitPassed} of ${s.unit} passed` : "—"} | ${s.lastRun} (\`${s.commit}\`) | [${s.report}](${s.report}) |`);
+  md.push("");
+  for (const s of Object.values(state.suites)) {
+    md.push(`## ${s.name}: tests covered`, "");
+    for (const a of s.covered) {
+      md.push(`**${a.area}**`, "");
+      for (const t of a.tests) md.push(`- ${t.pass ? "✅" : "❌"} ${t.id} · ${t.title}`);
+      md.push("");
+    }
+  }
+  md.push("## Runs today", "", "| Time | Suite | Code | Browser scenarios | Unit tests |", "|---|---|---|---|---|");
+  for (const r of state.runs) md.push(`| ${r.time} | ${cell(r.suite)} | \`${r.commit}\` | ${r.passed} of ${r.scenarios} passed${r.failed ? ` (${r.failed} failed)` : ""} | ${r.unit ? `${r.unitPassed} of ${r.unit} passed` : "—"} |`);
+  md.push("", "Screenshots are in the folder named after each suite. Everything shown is made-up test data.", "");
+  return md.join("\n");
+}
+
+/** test-results/README.md: one row per day. `days`: [{ folder, suites }] newest first. */
+export function renderIndex(days) {
+  return [
+    "# Test results", "",
+    "One folder per day, named MMDDYYYY. Each has a `README.md` listing what was tested that day, a report per suite with a screenshot of every scenario, and the screenshots.", "",
+    "| Day (MMDDYYYY) | What was tested |", "|---|---|",
+    ...days.map((d) => `| [${d.folder}](${d.folder}/README.md) | ${Object.values(d.suites).map((s) => `${cell(s.name)}: ${s.passed} of ${s.scenarios} passed`).join("; ")} |`), "",
+  ].join("\n");
+}
+
+/** `ok 1 - name` / `not ok 2 - name` lines of Node's TAP reporter → [{name, pass}]. */
+export function parseTap(out) {
+  return [...String(out).matchAll(/^(ok|not ok) \d+ - (.+)$/gm)].map((m) => ({ pass: m[1] === "ok", name: m[2] }));
+}
+
+/** Runs unit test files with Node's test runner and returns [{name, pass}]. `args` e.g. ["--import", "tsx", "--test", "--test-reporter=tap", "tests/x.test.ts"]. */
+export function runUnitTests(cwd, args) {
+  try {
+    return parseTap(execFileSync("node", args, { cwd, encoding: "utf8" }));
+  } catch (e) {
+    return parseTap(e.stdout ?? "");
+  }
+}
+
+/**
+ * Starts a run. `root` is the repository; `suite` { key: "pharmacy", name: "Pharmacy module" }.
+ * Returns { shotsDir, results, test(), finish() }.
+ */
+export function createRun({ root, suite, now = new Date(), timeZone = "Asia/Kolkata", zoneLabel = "IST", log = console.log }) {
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(suite.key)) throw new Error("suite.key must be lower-case letters, digits and hyphens");
+  const parts = dayParts(now, timeZone, zoneLabel);
+  const base = join(root, "test-results");
+  const out = join(base, parts.folder);
+  const shotsDir = join(out, suite.key);
+  rmSync(shotsDir, { recursive: true, force: true }); // old screenshots of this suite never linger
+  mkdirSync(shotsDir, { recursive: true });
+  const results = [];
+
+  /**
+   * One scenario. `fn` returns { pass, actual }; if it throws, the scenario
+   * fails with the first line of the error and the run carries on. `page` is
+   * a Playwright page to screenshot afterwards (null for a data-only check).
+   */
+  async function test(area, title, did, expected, page, fn) {
+    const id = `T${String(results.length + 1).padStart(2, "0")}`;
+    let pass = false, actual = "";
+    try {
+      const r = await fn();
+      pass = Boolean(r.pass);
+      actual = r.actual;
+    } catch (e) {
+      actual = `The test could not finish: ${String(e?.message ?? e).split("\n")[0]}`;
+    }
+    let shot = null;
+    if (page) {
+      shot = slug(id, title);
+      await page.screenshot({ path: join(shotsDir, shot), fullPage: true }).catch(() => { shot = null; });
+    }
+    results.push({ id, area, title, did, expected, actual, pass, shot });
+    log(`${pass ? "PASS" : "FAIL"} ${id} ${title}${pass ? "" : `\n      ${actual}`}`);
+    return pass;
+  }
+
+  /** Writes the report, the day's README and the index. Returns { passed, failed, report }. */
+  function finish({ unit = [], unitSource, intro, notCovered, rerun } = {}) {
+    let commit = "unknown";
+    try { commit = execFileSync("git", ["rev-parse", "--short", "HEAD"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch {}
+    const run = { suite, day: parts.day, time: parts.time, commit, intro, results, unit, unitSource, notCovered, rerun };
+    writeFileSync(join(out, `${suite.key}.md`), renderReport(run));
+    const stateFile = join(out, "runs.json");
+    const state = mergeDayState(existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) : null, run);
+    writeFileSync(stateFile, JSON.stringify(state, null, 2) + "\n");
+    writeFileSync(join(out, "README.md"), renderDayReadme(state, parts.day));
+    const days = sortDayFolders(readdirSync(base)).filter((f) => existsSync(join(base, f, "runs.json"))).map((folder) => ({ folder, suites: JSON.parse(readFileSync(join(base, folder, "runs.json"), "utf8")).suites }));
+    writeFileSync(join(base, "README.md"), renderIndex(days));
+    const passed = results.filter((r) => r.pass).length;
+    const unitFailed = unit.filter((u) => !u.pass).length;
+    log(`\n${passed} of ${results.length} browser scenarios passed${unit.length ? `; ${unit.length - unitFailed} of ${unit.length} unit tests passed` : ""}.\nReport: test-results/${parts.folder}/${suite.key}.md`);
+    return { passed, failed: results.length - passed + unitFailed, report: join(out, `${suite.key}.md`), folder: parts.folder };
+  }
+
+  return { shotsDir, results, folder: parts.folder, test, finish };
+}
