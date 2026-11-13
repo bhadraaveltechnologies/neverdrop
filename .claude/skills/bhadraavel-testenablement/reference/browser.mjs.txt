@@ -1,0 +1,73 @@
+// Browser helpers for a test suite (bhadraavel-testenablement).
+// Copy as tests/e2e/lib/browser.mjs. Needs Playwright, installed globally:
+//   NODE_PATH=$(npm root -g) node tests/e2e/<suite>.mjs
+// (ESM `import` ignores NODE_PATH; createRequire does not, hence the require.)
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+
+/**
+ * A suite resets test data, so it must never reach a real customer. Call this
+ * first with every address the suite touches (the app, the database).
+ */
+export function localOnly(...urls) {
+  for (const u of urls) {
+    if (!u || !/(^|[/@])(localhost|127\.0\.0\.1)([:/]|$)/.test(u)) throw new Error(`This test resets data, so it only runs against a local app and database. Refusing: ${String(u).replace(/:[^:@/]*@/, ":****@")}`);
+  }
+}
+
+/** KEY=value lines of a .env file (no quotes or export handling: enough for DATABASE_URL and the like). */
+export function readEnv(text) {
+  return Object.fromEntries(text.split("\n").filter((l) => /^[A-Z0-9_]+=/.test(l)).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1).trim()]));
+}
+
+export async function launch() {
+  const { chromium } = require("playwright");
+  return chromium.launch();
+}
+
+/** A page whose screenshots are sharp enough to read and small enough to commit (about 250 KB each). */
+export async function newPage(browser) {
+  const ctx = await browser.newContext({ viewport: { width: 1240, height: 860 }, deviceScaleFactor: 1.5 });
+  const page = await ctx.newPage();
+  page.on("pageerror", (e) => console.log("PAGE ERROR", e.message));
+  return page;
+}
+
+export const clean = (s) => (s ?? "").replace(/\s+/g, " ").trim();
+
+/**
+ * Clicks a button that submits a form and waits for what it causes: the POST
+ * (a server action or an API call), then the page it lands on. Without this,
+ * the next step races the redirect and reads the old page.
+ */
+export async function submit(page, button) {
+  await Promise.all([page.waitForResponse((r) => r.request().method() === "POST", { timeout: 20000 }), button.click()]);
+  await page.waitForLoadState("networkidle");
+}
+
+/** Reloads the page without its ?ok= / ?err= message, so the next message read is the next action's. */
+export const fresh = (page) => page.goto(page.url().split("?")[0]);
+
+/** The text of the page's result message (pass the selector your app uses for it). */
+export async function flash(page, selector = ".notice.ok, .notice.err") {
+  return clean(await page.locator(selector).first().innerText().catch(() => ""));
+}
+
+/**
+ * Signs in with a one-time code shown on screen (apps built with the
+ * "codes on screen until WhatsApp is connected" switch). Sign each role in
+ * ONCE per run: the apps make a phone wait 30 seconds between codes.
+ */
+export async function signInWithScreenCode(browser, base, phone, sel = {}) {
+  const s = { path: "/login", phone: 'input[type="tel"]', send: 'button:has-text("Send code")', shown: ".code-shown", code: 'input[autocomplete="one-time-code"]', go: 'button:has-text("Sign in")', ...sel };
+  const page = await newPage(browser);
+  await page.goto(`${base}${s.path}`);
+  await page.fill(s.phone, phone);
+  await page.click(s.send);
+  const code = (await page.locator(s.shown).textContent({ timeout: 15000 })).trim();
+  await page.fill(s.code, code);
+  await page.click(s.go);
+  await page.waitForURL((u) => !u.pathname.startsWith(s.path));
+  return page;
+}

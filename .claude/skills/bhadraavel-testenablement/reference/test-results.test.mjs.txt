@@ -1,0 +1,100 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createRun, dayParts, mergeDayState, parseTap, renderDayReadme, renderIndex, renderReport, slug, sortDayFolders } from "./test-results.mjs";
+
+const quiet = () => {};
+const fakePage = (dir) => ({ screenshot: async ({ path }) => writeFileSync(path, "png") });
+
+test("the day's folder is MMDDYYYY in the app's timezone, not the server's", () => {
+  // 13 Nov 2026 20:30 UTC is already 14 Nov, 02:00 in India
+  const p = dayParts(new Date("2026-11-13T20:30:00Z"));
+  assert.equal(p.folder, "11142026");
+  assert.equal(p.day, "14 November 2026");
+  assert.equal(p.time, "02:00 IST");
+  assert.equal(dayParts(new Date("2026-11-13T12:16:00Z")).folder, "11132026");
+  assert.equal(dayParts(new Date("2027-01-05T06:00:00Z"), "UTC", "UTC").folder, "01052027");
+});
+
+test("days sort as dates, newest first, and stray folders are ignored", () => {
+  assert.deepEqual(sortDayFolders(["12312026", "01052027", "11132026", "notes", "README.md"]), ["01052027", "12312026", "11132026"]);
+});
+
+test("screenshot names are safe file names", () => {
+  assert.equal(slug("T07", "A paid invoice can't be edited (₹168.10)!"), "t07-a-paid-invoice-can-t-be-edited-168-10.png");
+  assert.ok(slug("T01", "x".repeat(200)).length <= 4 + 48 + 4);
+});
+
+const run = (over = {}) => ({
+  suite: { key: "pharmacy", name: "Pharmacy module" }, day: "13 November 2026", time: "17:46 IST", commit: "abc1234",
+  results: [
+    { id: "T01", area: "Stock", title: "Add a medicine", did: "Added one.", expected: "Saved.", actual: "Saved.", pass: true, shot: "t01-add-a-medicine.png" },
+    { id: "T02", area: "Stock", title: "Books agree", did: "Compared.", expected: "Equal.", actual: "Equal.", pass: true, shot: null },
+    { id: "T03", area: "Payment", title: "Pay | by UPI", did: "Paid.", expected: "Invoice.", actual: "Refused.", pass: false, shot: "t03-pay-by-upi.png" },
+  ],
+  unit: [{ name: "GST from inside MRP", pass: true }],
+  ...over,
+});
+
+test("the report shows every scenario with its screenshot, and says plainly when something failed", () => {
+  const md = renderReport(run({ notCovered: ["Printing on paper."], rerun: "node tests/e2e/pharmacy.mjs" }));
+  assert.match(md, /^# Pharmacy module: test results/);
+  assert.match(md, /\| In the browser, with a screenshot each \| 3 \| 2 \| 1 \|/);
+  assert.match(md, /\*\*1 did not pass\.\*\*/);
+  assert.match(md, /!\[T01: Add a medicine\]\(pharmacy\/t01-add-a-medicine\.png\)/);
+  assert.match(md, /_No screenshot: this check reads the data directly\._/);
+  assert.match(md, /\| \[T03\]\(#t03\) \| Payment \| Pay \\\| by UPI \| ❌ Fail \|/, "a | in a title cannot break the table");
+  assert.match(md, /- \*\*What happened:\*\* Refused\./);
+  assert.match(md, /## Not covered by this run\n\n- Printing on paper\./);
+  assert.match(renderReport(run({ results: run().results.slice(0, 2) })), /\*\*Everything passed\.\*\*/);
+});
+
+test("a second run the same day replaces the suite's summary and adds to the log; another suite sits beside it", () => {
+  let s = mergeDayState(null, run());
+  s = mergeDayState(s, run({ time: "18:10 IST", results: run().results.map((r) => ({ ...r, pass: true })) }));
+  assert.equal(Object.keys(s.suites).length, 1);
+  assert.equal(s.suites.pharmacy.failed, 0);
+  assert.equal(s.suites.pharmacy.lastRun, "18:10 IST");
+  assert.equal(s.runs.length, 2);
+  assert.equal(s.runs[0].failed, 1, "the earlier run's result is kept in the log");
+  s = mergeDayState(s, run({ suite: { key: "billing", name: "Billing" }, time: "18:30 IST", unit: [] }));
+  assert.deepEqual(Object.keys(s.suites), ["pharmacy", "billing"]);
+  const md = renderDayReadme(s, "13 November 2026");
+  assert.match(md, /\| Pharmacy module \| 3 \| 3 \| 0 \| 1 of 1 passed \| 18:10 IST \(`abc1234`\) \| \[pharmacy\.md\]\(pharmacy\.md\) \|/);
+  assert.match(md, /\| Billing \| 3 \| 2 \| 1 \| — \|/);
+  assert.match(md, /\| 17:46 IST \| Pharmacy module \| `abc1234` \| 2 of 3 passed \(1 failed\) \|/);
+  assert.match(md, /- ❌ T03 · Pay \| by UPI/);
+  assert.match(renderIndex([{ folder: "11132026", suites: s.suites }]), /\| \[11132026\]\(11132026\/README\.md\) \| Pharmacy module: 3 of 3 passed; Billing: 2 of 3 passed \|/);
+});
+
+test("Node's TAP output becomes the unit-test table", () => {
+  assert.deepEqual(parseTap("TAP version 13\nok 1 - sold at MRP\nnot ok 2 - expiry\n# pass 1\n"), [{ name: "sold at MRP", pass: true }, { name: "expiry", pass: false }]);
+});
+
+test("a whole run writes the report, the day's README, the index and the screenshots; a thrown scenario fails without stopping the run", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tr-"));
+  const now = new Date("2026-11-13T12:16:00Z");
+  const r = createRun({ root, suite: { key: "pharmacy", name: "Pharmacy module" }, now, log: quiet });
+  assert.equal(await r.test("Stock", "Add a medicine", "Did.", "Saved.", fakePage(), async () => ({ pass: true, actual: "Saved." })), true);
+  assert.equal(await r.test("Stock", "Breaks", "Did.", "Works.", fakePage(), async () => { throw new Error("locator timed out\n  at x"); }), false);
+  await r.test("Stock", "Data only", "Did.", "Equal.", null, async () => ({ pass: true, actual: "Equal." }));
+  const done = r.finish({ unit: [{ name: "rule", pass: true }] });
+  assert.equal(done.failed, 1);
+  const day = join(root, "test-results", "11132026");
+  assert.deepEqual(readdirSync(join(day, "pharmacy")).sort(), ["t01-add-a-medicine.png", "t02-breaks.png"]);
+  assert.match(readFileSync(join(day, "pharmacy.md"), "utf8"), /The test could not finish: locator timed out/);
+  assert.ok(existsSync(join(day, "README.md")) && existsSync(join(root, "test-results", "README.md")));
+
+  // the same day again: old screenshots go, the README shows the new result, the log has both runs
+  const r2 = createRun({ root, suite: { key: "pharmacy", name: "Pharmacy module" }, now: new Date("2026-11-13T12:40:00Z"), log: quiet });
+  await r2.test("Stock", "Add a medicine", "Did.", "Saved.", fakePage(), async () => ({ pass: true, actual: "Saved." }));
+  r2.finish();
+  assert.deepEqual(readdirSync(join(day, "pharmacy")), ["t01-add-a-medicine.png"]);
+  const state = JSON.parse(readFileSync(join(day, "runs.json"), "utf8"));
+  assert.equal(state.runs.length, 2);
+  assert.equal(state.suites.pharmacy.scenarios, 1);
+  assert.match(readFileSync(join(day, "README.md"), "utf8"), /\| 17:46 IST \|[^\n]*\n\| 18:10 IST \|/);
+  assert.throws(() => createRun({ root, suite: { key: "Bad Key", name: "x" } }));
+});

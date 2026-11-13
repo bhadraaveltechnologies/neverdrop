@@ -1,6 +1,6 @@
 ---
 name: bhadraavel
-description: The front door to every Bhadraavel skill. Finds the skills installed in this app, asks what the user is trying to do, and runs the right one — or a bundle of them in the right order (a new app from scratch, adding payments, connecting to the support desk and the error bus, branding and images, automatic deploys). Use whenever the user types /bhadraavel, asks "what skills do we have", "which skill should I use", wants a menu or a catalog of the Bhadraavel skills, or describes a goal without naming a skill.
+description: The front door to every Bhadraavel skill. Finds the skills installed in this app, asks what the user is trying to do, and runs the right one — or a bundle of them in the right order (a new app from scratch, adding payments, connecting to the support desk and the error bus, branding and images, automatic deploys, testing a feature and showing the results). Use whenever the user types /bhadraavel, asks "what skills do we have", "which skill should I use", wants a menu or a catalog of the Bhadraavel skills, or describes a goal without naming a skill.
 ---
 
 # /bhadraavel — the master skill
@@ -41,6 +41,7 @@ about what is missing, not what is done. Cheap markers:
 | `bhadraavel-razorpay` | `RAZORPAY_KEY_ID` in `.env.example`, a `billing` module, `/pricing` |
 | `bhadraavel-image-editor` | an `ImageEditor` component |
 | `bhadraavel-share` | a Share button / `share` module |
+| `bhadraavel-testenablement` | `tests/e2e/lib/test-results.mjs` and a `test-results/` folder |
 | `github-vps-deploy` | `.github/workflows/deploy.yml` and `deploy/redeploy.sh` |
 
 Say what you found in one short list ("Already here: footer, support
@@ -128,7 +129,18 @@ When `github-vps-deploy` is not installed in the app, say it lives in the
 `website` and `support-hub` repositories' `.claude/skills/` and offer to
 copy it in.
 
-### F. Keep an app to the standard (audit, then fix)
+### F. Test a feature and show the results
+
+| Step | Skill | Why |
+|---|---|---|
+| 1 | `bhadraavel-testenablement` | a browser suite for the feature, a screenshot of every scenario, the report and the day's README under `test-results/<MMDDYYYY>/` |
+
+Offer it after any bundle that built something a person will use, and
+whenever the user asks for proof, test results or screenshots. It needs
+the app running locally with its database; it never runs against a real
+customer.
+
+### G. Keep an app to the standard (audit, then fix)
 
 Section 2 in full, as a table of applied / missing, then offer to run the
 missing ones as a bundle in the order of A.
@@ -150,12 +162,13 @@ When asked for the whole catalog, print it as a table — `/<name>` and
 the first sentence of its description — grouped as: **start** (appreq),
 **every app** (footer, support, error-reporting, deploy), **paid apps**
 (razorpay), **images and sharing** (image-editor, gemini-image, share),
+**testing** (testenablement),
 **other** (anything else installed). Then ask which to run.
 
 ## 7. Adding a skill to the factory
 
 When the user asks for a new shared skill, tell them it goes in
 `Bhadraa-SkillFactory/skills/<name>/SKILL.md` (lower-case, hyphens, the
-`bhadraavel-` prefix; reference code as `*.ts.txt`), with a row in that
+`bhadraavel-` prefix; reference code as `*.ts.txt` / `*.mjs.txt`), with a row in that
 README; the sync copies it to every app. This menu picks it up on the
 next run — nothing to add here, unless it belongs in a bundle (section 4).

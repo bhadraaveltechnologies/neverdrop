@@ -1,0 +1,73 @@
+// A test suite, in the shape every Bhadraavel suite takes (bhadraavel-testenablement).
+// Copy as tests/e2e/<feature>.mjs and replace the scenarios. This one is cut
+// down from myclinicapp's tests/e2e/pharmacy.mjs (33 scenarios), the pilot.
+//
+//   NODE_PATH=$(npm root -g) node --import tsx tests/e2e/pharmacy.mjs
+//
+// It RESETS the feature's test data: localOnly() refuses anything but localhost.
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import pg from "pg";
+import { createRun, runUnitTests } from "./lib/test-results.mjs";
+import { clean, flash, launch, localOnly, readEnv, signInWithScreenCode, submit } from "./lib/browser.mjs";
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const BASE = process.env.E2E_BASE_URL || "http://localhost:3300";
+const DB = process.env.DATABASE_URL || readEnv(readFileSync(join(ROOT, ".env"), "utf8")).DATABASE_URL;
+localOnly(BASE, DB);
+
+const run = createRun({ root: ROOT, suite: { key: "pharmacy", name: "Pharmacy module" } });
+const db = new pg.Client({ connectionString: DB });
+await db.connect();
+const q = async (sql, params = []) => (await db.query(sql, params)).rows;
+
+// 1. A clean start, every run: yesterday's leftovers make today's screenshots lie.
+await q("TRUNCATE pharmacy_moves, pharmacy_returns, pharmacy_sale_lines, pharmacy_sales, medicine_batches, medicines RESTART IDENTITY CASCADE");
+await q("DELETE FROM settings WHERE key = 'pharmacy' OR key LIKE 'pharmacy_counter:%'");
+await q(`INSERT INTO settings (key, value) VALUES ('plan_local', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [JSON.stringify({ package: "premium", addons: ["pharmacy"], overrides: {}, limits: {} })]);
+
+const browser = await launch();
+const admin = await signInWithScreenCode(browser, BASE, "9999900001"); // once per role per run
+
+// 2. Scenarios: area, title, what was done, what is expected, the page to photograph, the check.
+await admin.goto(`${BASE}/pharmacy`);
+await run.test("Plan", "With the add-on, the counter opens and asks for the drug licence",
+  "Added the Pharmacy add-on to the plan and opened /pharmacy as the clinic admin.",
+  "The counter page, with a notice to record the drug licence before the first sale.", admin, async () => {
+    const notice = clean(await admin.locator(".notice.info").first().innerText().catch(() => ""));
+    return { pass: /drug licence/i.test(notice), actual: `Notice: “${notice}”` };
+  });
+
+await admin.goto(`${BASE}/pharmacy/stock`);
+const form = admin.locator('form:has(h2:has-text("Add a medicine"))');
+await form.locator('input[name="name"]').fill("Dolo 650");
+await form.locator('input[name="generic"]').fill("Paracetamol 650 mg");
+await submit(admin, form.locator("button"));
+const msg = await flash(admin, ".wrap > .notice.ok, .wrap > .notice.err");
+await run.test("Stock", "Add a medicine",
+  "On Stock & medicines, added “Dolo 650” (Paracetamol 650 mg).",
+  "The medicine is saved and its own page opens, ready to receive stock.", admin, async () => {
+    // Check the screen AND the data: a message alone can lie.
+    const rows = await q("SELECT name FROM medicines");
+    return { pass: /Added/.test(msg) && rows.length === 1 && rows[0].name === "Dolo 650", actual: `Message: “${msg}” Database has: ${rows.map((r) => r.name).join(", ")}.` };
+  });
+
+await run.test("Stock", "Stock on hand equals the stock book, for every batch",
+  "Compared, in the database, each batch's stock on hand with the sum of its stock-book lines.",
+  "They agree for every batch.", null /* no page: no screenshot */, async () => {
+    const bad = await q("SELECT b.batch_no FROM medicine_batches b LEFT JOIN pharmacy_moves m ON m.batch_id = b.id GROUP BY b.id HAVING b.on_hand <> coalesce(sum(m.qty), 0)");
+    return { pass: bad.length === 0, actual: bad.length ? `Disagree: ${bad.map((b) => b.batch_no).join(", ")}` : "No batch disagrees." };
+  });
+
+await browser.close();
+await db.end();
+
+// 3. The rules' unit tests, in the same report; then write everything.
+const unit = process.env.E2E_SKIP_UNIT ? [] : runUnitTests(ROOT, ["--import", "tsx", "--test", "--test-reporter=tap", "tests/pharmacy.test.ts"]);
+const done = run.finish({
+  unit, unitSource: "tests/pharmacy.test.ts",
+  notCovered: ["WhatsApp delivery of the invoice link (WhatsApp is not connected yet).", "Printing on paper: the invoice was checked on screen only."],
+  rerun: "NODE_PATH=$(npm root -g) node --import tsx tests/e2e/pharmacy.mjs",
+});
+process.exit(done.failed ? 1 : 0);
