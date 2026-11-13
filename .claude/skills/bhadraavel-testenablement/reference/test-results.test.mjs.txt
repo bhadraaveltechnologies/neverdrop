@@ -69,6 +69,19 @@ test("a second run the same day replaces the suite's summary and adds to the log
   assert.match(renderIndex([{ folder: "11132026", suites: s.suites }]), /\| \[11132026\]\(11132026\/README\.md\) \| Pharmacy module: 3 of 3 passed; Billing: 2 of 3 passed \|/);
 });
 
+test("a checks suite (unit tests, typecheck, build) reads as checks, with no screenshots expected", async () => {
+  const md = renderReport(run({ suite: { key: "checks", name: "Unit tests, typecheck and build", kind: "checks" }, unit: [], results: run().results.map((r) => ({ ...r, shot: null, pass: true })) }));
+  assert.match(md, /\| \| Checks \| Passed \| Failed \|\n\|---\|---\|---\|---\|\n\| Run from the command line \| 3 \| 3 \| 0 \|/);
+  assert.match(md, /These checks have no screen, so there are no screenshots\./);
+  assert.doesNotMatch(md, /No screenshot: this check reads the data directly/);
+  assert.doesNotMatch(md, /In the browser/);
+  const root = mkdtempSync(join(tmpdir(), "tr-"));
+  const r = createRun({ root, suite: { key: "checks", name: "Unit tests, typecheck and build", kind: "checks" }, now: new Date("2026-11-13T12:16:00Z"), log: quiet });
+  await r.test("Typecheck", "The code typechecks", "Ran tsc.", "No errors.", null, async () => ({ pass: true, actual: "No errors." }));
+  r.finish();
+  assert.deepEqual(readdirSync(join(root, "test-results", "11132026")).sort(), ["README.md", "checks.md", "runs.json"], "no empty screenshots folder");
+});
+
 test("Node's TAP output becomes the unit-test table", () => {
   assert.deepEqual(parseTap("TAP version 13\nok 1 - sold at MRP\nnot ok 2 - expiry\n# pass 1\n"), [{ name: "sold at MRP", pass: true }, { name: "expiry", pass: false }]);
 });
