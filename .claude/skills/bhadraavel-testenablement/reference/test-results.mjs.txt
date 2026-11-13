@@ -37,8 +37,13 @@ export function slug(id, title) {
 const mark = (pass) => (pass ? "✅ Pass" : "❌ Fail");
 const cell = (s) => String(s ?? "").replace(/\|/g, "\\|").replace(/\n+/g, " ");
 
+// A suite is "browser" (the default: scenarios driven in a browser, each with
+// a screenshot) or "checks" (things with no screen: unit tests, the
+// typecheck, the build; no screenshots are expected).
+const isChecks = (suite) => suite.kind === "checks";
+
 /**
- * The report for one suite. `run`: { suite: {key, name}, day, time, commit,
+ * The report for one suite. `run`: { suite: {key, name, kind?}, day, time, commit,
  * intro, results: [{id, area, title, did, expected, actual, pass, shot}],
  * unit: [{name, pass}], unitSource, notCovered: [..], rerun }.
  */
@@ -49,12 +54,15 @@ export function renderReport(run) {
   const unitPassed = unit.filter((u) => u.pass).length;
   const areas = [...new Set(results.map((r) => r.area))];
   const md = [`# ${run.suite.name}: test results`, ""];
-  md.push(`**${run.day}, ${run.time}** · code at commit \`${run.commit}\` · ${run.intro ?? "run in a real browser (Chromium) against a local copy of the app with test data."}`, "");
-  md.push("| | Scenarios | Passed | Failed |", "|---|---|---|---|", `| In the browser, with a screenshot each | ${results.length} | ${passed} | ${failed} |`);
+  const checks = isChecks(run.suite);
+  md.push(`**${run.day}, ${run.time}** · code at commit \`${run.commit}\` · ${run.intro ?? (checks ? "run from the command line on a copy of the code." : "run in a real browser (Chromium) against a local copy of the app with test data.")}`, "");
+  md.push(`| | ${checks ? "Checks" : "Scenarios"} | Passed | Failed |`, "|---|---|---|---|", `| ${checks ? "Run from the command line" : "In the browser, with a screenshot each"} | ${results.length} | ${passed} | ${failed} |`);
   if (unit.length) md.push(`| Rules, unit-tested${run.unitSource ? ` (\`${run.unitSource}\`)` : ""} | ${unit.length} | ${unitPassed} | ${unit.length - unitPassed} |`);
   md.push("", failed === 0 && unitPassed === unit.length ? "**Everything passed.**" : `**${failed + (unit.length - unitPassed)} did not pass.** They are marked ❌ below.`, "");
-  md.push("## How to read this", "", "Each scenario says what was done, what should happen, and what did happen, with a screenshot taken at that moment. All people, records and numbers shown are made-up test data.", "");
-  md.push("## Summary", "", "| # | Area | Scenario | Result |", "|---|---|---|---|");
+  md.push("## How to read this", "", checks
+    ? "Each check says what was run, what should happen, and what did happen. These checks have no screen, so there are no screenshots."
+    : "Each scenario says what was done, what should happen, and what did happen, with a screenshot taken at that moment. All people, records and numbers shown are made-up test data.", "");
+  md.push("## Summary", "", `| # | Area | ${checks ? "Check" : "Scenario"} | Result |`, "|---|---|---|---|");
   for (const r of results) md.push(`| [${r.id}](#${r.id.toLowerCase()}) | ${cell(r.area)} | ${cell(r.title)} | ${mark(r.pass)} |`);
   md.push("");
   for (const a of areas) {
@@ -62,7 +70,8 @@ export function renderReport(run) {
     for (const r of results.filter((x) => x.area === a)) {
       md.push(`<a id="${r.id.toLowerCase()}"></a>`, "", `### ${r.id} · ${r.title} ${r.pass ? "✅" : "❌"}`, "");
       md.push(`- **What was done:** ${r.did}`, `- **Expected:** ${r.expected}`, `- **What happened:** ${r.actual}`, `- **Result:** ${r.pass ? "Pass" : "Fail"}`, "");
-      md.push(r.shot ? `![${r.id}: ${r.title}](${run.suite.key}/${r.shot})` : "_No screenshot: this check reads the data directly._", "");
+      if (r.shot) md.push(`![${r.id}: ${r.title}](${run.suite.key}/${r.shot})`, "");
+      else if (!checks) md.push("_No screenshot: this check reads the data directly._", "");
     }
   }
   if (unit.length) {
@@ -106,9 +115,9 @@ export function renderDayReadme(state, day) {
       md.push("");
     }
   }
-  md.push("## Runs today", "", "| Time | Suite | Code | Browser scenarios | Unit tests |", "|---|---|---|---|---|");
+  md.push("## Runs today", "", "| Time | Suite | Code | Scenarios or checks | Unit tests |", "|---|---|---|---|---|");
   for (const r of state.runs) md.push(`| ${r.time} | ${cell(r.suite)} | \`${r.commit}\` | ${r.passed} of ${r.scenarios} passed${r.failed ? ` (${r.failed} failed)` : ""} | ${r.unit ? `${r.unitPassed} of ${r.unit} passed` : "—"} |`);
-  md.push("", "Screenshots are in the folder named after each suite. Everything shown is made-up test data.", "");
+  md.push("", "Screenshots are in the folder named after each browser suite. Everything shown is made-up test data.", "");
   return md.join("\n");
 }
 
@@ -137,7 +146,8 @@ export function runUnitTests(cwd, args) {
 }
 
 /**
- * Starts a run. `root` is the repository; `suite` { key: "pharmacy", name: "Pharmacy module" }.
+ * Starts a run. `root` is the repository; `suite` { key: "pharmacy", name: "Pharmacy module" },
+ * with kind: "checks" for a suite with no screen (unit tests, typecheck, build).
  * Returns { shotsDir, results, test(), finish() }.
  */
 export function createRun({ root, suite, now = new Date(), timeZone = "Asia/Kolkata", zoneLabel = "IST", log = console.log }) {
@@ -147,7 +157,7 @@ export function createRun({ root, suite, now = new Date(), timeZone = "Asia/Kolk
   const out = join(base, parts.folder);
   const shotsDir = join(out, suite.key);
   rmSync(shotsDir, { recursive: true, force: true }); // old screenshots of this suite never linger
-  mkdirSync(shotsDir, { recursive: true });
+  mkdirSync(isChecks(suite) ? out : shotsDir, { recursive: true }); // a checks suite has no screenshots, so no folder
   const results = [];
 
   /**
@@ -189,7 +199,7 @@ export function createRun({ root, suite, now = new Date(), timeZone = "Asia/Kolk
     writeFileSync(join(base, "README.md"), renderIndex(days));
     const passed = results.filter((r) => r.pass).length;
     const unitFailed = unit.filter((u) => !u.pass).length;
-    log(`\n${passed} of ${results.length} browser scenarios passed${unit.length ? `; ${unit.length - unitFailed} of ${unit.length} unit tests passed` : ""}.\nReport: test-results/${parts.folder}/${suite.key}.md`);
+    log(`\n${passed} of ${results.length} ${isChecks(suite) ? "checks" : "browser scenarios"} passed${unit.length ? `; ${unit.length - unitFailed} of ${unit.length} unit tests passed` : ""}.\nReport: test-results/${parts.folder}/${suite.key}.md`);
     return { passed, failed: results.length - passed + unitFailed, report: join(out, `${suite.key}.md`), folder: parts.folder };
   }
 

@@ -127,6 +127,23 @@ Start from `reference/suite-example.mjs.txt`. Its shape, in order:
   ledger; totals equal the invoices).
 - End the report with **"Not covered by this run"**, honestly.
 
+### Running every test of an app, and recording it
+
+"Run all the tests" means the checks with no screen as well as the browser
+suites. Record them the same way, as a suite of kind `"checks"`:
+
+```js
+const run = createRun({ root: ROOT, suite: { key: "checks", name: "Unit tests, typecheck and build", kind: "checks" } });
+await run.test("Typecheck", "The code typechecks", "Ran npx tsc --noEmit.", "No errors.", null, async () => ...);
+```
+
+One entry for the typecheck, one for the production build, and one per unit
+test (run each test file with `runUnitTests()` and use the file as the
+area). A checks suite has no screenshots and its report says so. Then run
+each browser suite. Order matters: **build first, restart the app on the
+new build, then the browser suites**. The day's README then lists every
+suite side by side. myclinicapp's `tests/e2e/checks.mjs` is the example.
+
 ## 5. The parts that took debugging
 
 - **Look at the screenshots yourself before reporting.** In the pilot all
@@ -159,6 +176,14 @@ Start from `reference/suite-example.mjs.txt`. Its shape, in order:
 - **Simulating time.** For "expired on the shelf", insert the batch (and
   its ledger line) directly with a past date; the app rightly refuses to
   receive expired stock through the screen.
+- **A suite that stops at sign-in.** The apps allow a phone six sign-in
+  codes an hour, 30 seconds apart; a day of test runs uses them up and the
+  next run dies waiting for the code, before its first scenario. In the
+  clean start, delete the test accounts' rows from the codes table
+  (`DELETE FROM otp_codes WHERE phone = ANY($1)`): local test data only.
+- **Disabled options.** Read a greyed-out `<option>` with
+  `evaluate((o) => o.disabled)`; Playwright's `isDisabled()` answered false
+  for one that was disabled.
 - **Service down.** In the cloud build environment Postgres and the app
   stop when the container idles: start both and check the health address
   before every run.
