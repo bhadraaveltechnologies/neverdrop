@@ -1,0 +1,540 @@
+// The app-usage core (bhadraavel-appusage skill). Copy it into the app as
+// usage.ts (drop the .txt). Framework- and database-free: the app gives it a
+// UsageStore (see memory-store.ts for one, with the SQL beside each method)
+// and a GeoLookup, and calls trackVisit / trackEvent from its middleware and
+// from the places where accounts are made and money arrives.
+//
+// What it records, per app, per day (the app's own time zone, Asia/Kolkata
+// by default):
+//   - business events: registered, trial_started, first_paid, renewed,
+//     coupon_grant, admin_grant, refunded - each with the account, plan,
+//     amount and the coarse place (city, state, country) it came from;
+//   - visits: one row per visitor per feature per day, with a hit count -
+//     signed-in visitors by account, signed-out visitors by a key that is
+//     salted with a secret that changes every day, so they can be counted
+//     for that day and never followed across days.
+// What it never records: the IP address, the full user agent, query strings,
+// anything typed into a form.
+
+import crypto from "node:crypto";
+
+// ---------------------------------------------------------------- types
+
+export type EventKind =
+  | "registered" // an account was created
+  | "trial_started" // a trial subscription row was granted
+  | "first_paid" // the account's first paid subscription (a new customer, or a trial converted)
+  | "renewed" // a paid subscription when the account already had one before
+  | "coupon_grant" // a 100%-off coupon switched a plan on
+  | "admin_grant" // an admin gave days by hand
+  | "refunded"; // a payment was refunded
+
+export const EVENT_KINDS: EventKind[] = [
+  "registered",
+  "trial_started",
+  "first_paid",
+  "renewed",
+  "coupon_grant",
+  "admin_grant",
+  "refunded",
+];
+
+export type Place = { city: string | null; region: string | null; country: string | null };
+export const NOWHERE: Place = { city: null, region: null, country: null };
+
+export type UsageEvent = {
+  id: string;
+  at: Date;
+  day: string; // YYYY-MM-DD in the app's time zone
+  kind: EventKind;
+  userId: string;
+  planId: string | null;
+  amount: number | null; // in the smallest unit (paise), as the payment row has it
+  currency: string | null;
+  source: string | null; // razorpay | coupon | admin | trial | null
+} & Place;
+
+export type Visit = {
+  day: string;
+  feature: string;
+  visitorKey: string; // "u:<userId>" signed in, "a:<hash>" signed out
+  userId: string | null;
+  hits: number;
+  firstAt: Date;
+  lastAt: Date;
+} & Place;
+
+/** The account as the app knows it. Phone and name are optional: show what the app has. */
+export type Customer = {
+  id: string;
+  name: string | null;
+  email: string | null;
+  phone: string | null;
+  createdAt: Date;
+  isAdmin?: boolean;
+} & Partial<Place>;
+
+/** A subscription row as the bhadraavel-razorpay skill keeps it. */
+export type Sub = {
+  userId: string;
+  planId: string | null;
+  planName?: string | null;
+  source: "razorpay" | "coupon" | "admin" | "trial";
+  startsAt: Date;
+  endsAt: Date;
+};
+
+export interface UsageStore {
+  insertEvent(e: UsageEvent): Promise<void>;
+  /** INSERT … ON CONFLICT (day, feature, visitor_key) DO UPDATE SET hits = hits + 1, last_at = … */
+  upsertVisit(v: Omit<Visit, "hits" | "firstAt" | "lastAt">, at: Date): Promise<void>;
+  eventsOn(day: string): Promise<UsageEvent[]>;
+  visitsOn(day: string): Promise<Visit[]>;
+  /** Accounts by id; the app's own users table. */
+  customers(ids: string[]): Promise<Customer[]>;
+  /** Subscriptions of these accounts (empty when the app has no plans). */
+  subscriptions(ids: string[]): Promise<Sub[]>;
+  /** Paid subscriptions this account had before `before` (razorpay source). */
+  countPaidBefore(userId: string, before: Date): Promise<number>;
+  /** Keep the account's last known place on its row (users.last_city …). */
+  setLastPlace(userId: string, place: Place, at: Date): Promise<void>;
+  /** DELETE FROM usage_visits WHERE day < $1 */
+  deleteVisitsBefore(day: string): Promise<number>;
+}
+
+export interface GeoLookup {
+  /** City, state/region and country for an IP; NOWHERE when unknown. Never stored. */
+  lookup(ip: string): Place | Promise<Place>;
+}
+
+export type UsageConfig = {
+  timeZone: string; // USAGE_TIME_ZONE, default Asia/Kolkata
+  /** Server secret; with the day it makes the salt for signed-out visitors (USAGE_SALT_SECRET). */
+  saltSecret: string;
+  /** Path → feature. First match wins. Unlisted paths are counted as "other" unless ignored. */
+  features: { feature: string; match: RegExp }[];
+  /** Paths never counted: assets, health checks, the admin's own screens. */
+  ignore: RegExp[];
+  /** How many days of visit rows to keep (USAGE_RETENTION_DAYS, default 400). */
+  retentionDays: number;
+};
+
+export const DEFAULT_IGNORE: RegExp[] = [
+  /^\/(_next|static|assets|fonts|images|icons)\//,
+  /\.(js|css|map|png|jpe?g|gif|svg|webp|ico|woff2?|txt|xml|json|webmanifest)$/i,
+  /^\/(healthz?|api\/health|robots\.txt|sitemap\.xml|favicon\.ico|sw\.js)$/,
+  /^\/admin(\/|$)/,
+  /^\/api\//,
+];
+
+// ---------------------------------------------------------------- days and places
+
+/** The calendar day of an instant in a time zone, as YYYY-MM-DD. */
+export function dayOf(at: Date, timeZone = "Asia/Kolkata"): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(at);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+/** The day `n` days before `day` (calendar arithmetic, no time zone involved). */
+export function daysBefore(day: string, n: number): string {
+  const d = new Date(`${day}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - n);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * The client's IP. Trust X-Forwarded-For only when the app sits behind its
+ * own proxy (Traefik, nginx) - then the left-most address is the client's.
+ */
+export function clientIp(
+  headers: Record<string, string | string[] | undefined>,
+  remote: string | undefined,
+  behindProxy: boolean,
+): string | null {
+  if (behindProxy) {
+    const xf = headers["x-forwarded-for"];
+    const first = (Array.isArray(xf) ? xf[0] : xf)?.split(",")[0]?.trim();
+    if (first) return stripV4Mapped(first);
+    const real = headers["x-real-ip"];
+    if (typeof real === "string" && real) return stripV4Mapped(real.trim());
+  }
+  return remote ? stripV4Mapped(remote) : null;
+}
+
+function stripV4Mapped(ip: string): string {
+  return ip.startsWith("::ffff:") ? ip.slice(7) : ip;
+}
+
+/** Private, loopback and link-local addresses have no place. */
+export function isPrivateIp(ip: string): boolean {
+  return (
+    /^(10\.|127\.|192\.168\.|169\.254\.)/.test(ip) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(ip) ||
+    ip === "::1" ||
+    /^f[cd]/i.test(ip) ||
+    /^fe80:/i.test(ip)
+  );
+}
+
+/**
+ * The place for a request. A CDN's own headers win when present (Cloudflare
+ * sends cf-ipcountry, and cf-ipcity / cf-region with its location headers
+ * switched on); otherwise the offline GeoLookup. The IP is not kept.
+ */
+export async function placeOf(
+  headers: Record<string, string | string[] | undefined>,
+  ip: string | null,
+  geo: GeoLookup | null,
+): Promise<Place> {
+  const h = (k: string) => {
+    const v = headers[k];
+    const s = Array.isArray(v) ? v[0] : v;
+    return s && s !== "XX" && s !== "T1" ? s : null;
+  };
+  const country = h("cf-ipcountry");
+  if (country) return { city: h("cf-ipcity"), region: h("cf-region"), country };
+  if (!ip || isPrivateIp(ip) || !geo) return NOWHERE;
+  try {
+    return { ...NOWHERE, ...(await geo.lookup(ip)) };
+  } catch {
+    return NOWHERE;
+  }
+}
+
+// ---------------------------------------------------------------- what to count
+
+const BOT_UA =
+  /bot|crawl|spider|slurp|facebookexternalhit|whatsapp|telegrambot|preview|curl|wget|python-requests|httpclient|headless|lighthouse|pingdom|uptime|monitor/i;
+
+export function isBot(userAgent: string | undefined): boolean {
+  return !userAgent || BOT_UA.test(userAgent);
+}
+
+/** The feature a path belongs to, or null when the path is not counted. */
+export function featureOf(path: string, cfg: Pick<UsageConfig, "features" | "ignore">): string | null {
+  const p = path.split("?")[0].split("#")[0] || "/";
+  if (cfg.ignore.some((r) => r.test(p))) return null;
+  for (const f of cfg.features) if (f.match.test(p)) return f.feature;
+  return "other";
+}
+
+/**
+ * The key a signed-out visitor is counted under for one day. The salt is
+ * derived from the server secret and the day, so it is never stored, and
+ * yesterday's keys cannot be matched with today's.
+ */
+export function anonymousKey(ip: string, userAgent: string, day: string, saltSecret: string): string {
+  const salt = crypto.createHmac("sha256", saltSecret).update(`usage-salt:${day}`).digest();
+  return `a:${crypto.createHmac("sha256", salt).update(`${ip}\n${userAgent}`).digest("hex").slice(0, 24)}`;
+}
+
+// ---------------------------------------------------------------- tracking
+
+export type VisitInput = {
+  path: string;
+  method: string;
+  headers: Record<string, string | string[] | undefined>;
+  remoteAddress?: string;
+  behindProxy: boolean;
+  /** The signed-in account, if any. */
+  user?: { id: string; isAdmin?: boolean } | null;
+  at?: Date;
+};
+
+/**
+ * Count one page view. Call it from middleware for page requests (not API
+ * calls, not assets), after the response is sent or without awaiting it, so
+ * a slow store never slows a page. Returns what was counted, or null.
+ */
+export async function trackVisit(
+  store: UsageStore,
+  geo: GeoLookup | null,
+  cfg: UsageConfig,
+  input: VisitInput,
+): Promise<{ feature: string; visitorKey: string } | null> {
+  if (input.method !== "GET") return null;
+  const ua = String(input.headers["user-agent"] ?? "");
+  if (isBot(ua)) return null;
+  const purpose = input.headers["purpose"] ?? input.headers["sec-purpose"] ?? input.headers["x-moz"];
+  if (purpose && /prefetch|prerender/i.test(String(purpose))) return null;
+  if (input.headers["next-router-prefetch"]) return null;
+  if (input.user?.isAdmin) return null; // the team's own clicks are not customers
+  const feature = featureOf(input.path, cfg);
+  if (!feature) return null;
+
+  const at = input.at ?? new Date();
+  const day = dayOf(at, cfg.timeZone);
+  const ip = clientIp(input.headers, input.remoteAddress, input.behindProxy);
+  const place = await placeOf(input.headers, ip, geo);
+  const visitorKey = input.user
+    ? `u:${input.user.id}`
+    : anonymousKey(ip ?? "unknown", ua, day, cfg.saltSecret);
+
+  await store.upsertVisit(
+    { day, feature, visitorKey, userId: input.user?.id ?? null, ...place },
+    at,
+  );
+  if (input.user && place.country) await store.setLastPlace(input.user.id, place, at);
+  return { feature, visitorKey };
+}
+
+export type EventInput = {
+  kind: EventKind;
+  userId: string;
+  planId?: string | null;
+  amount?: number | null;
+  currency?: string | null;
+  source?: string | null;
+  place?: Place;
+  at?: Date;
+  id?: string;
+};
+
+/** Record a business event. Call it in the same place the account or subscription row is written. */
+export async function trackEvent(store: UsageStore, cfg: Pick<UsageConfig, "timeZone">, e: EventInput): Promise<UsageEvent> {
+  const at = e.at ?? new Date();
+  const event: UsageEvent = {
+    id: e.id ?? crypto.randomUUID(),
+    at,
+    day: dayOf(at, cfg.timeZone),
+    kind: e.kind,
+    userId: e.userId,
+    planId: e.planId ?? null,
+    amount: e.amount ?? null,
+    currency: e.currency ?? null,
+    source: e.source ?? null,
+    ...(e.place ?? NOWHERE),
+  };
+  await store.insertEvent(event);
+  return event;
+}
+
+/**
+ * Which event a newly activated subscription is: call it with the new row
+ * before (or without) inserting it. A paid row is a renewal when the account
+ * already had a paid row; otherwise its first payment.
+ */
+export async function eventForSubscription(store: UsageStore, sub: Sub): Promise<EventKind> {
+  switch (sub.source) {
+    case "trial":
+      return "trial_started";
+    case "coupon":
+      return "coupon_grant";
+    case "admin":
+      return "admin_grant";
+    case "razorpay":
+      return (await store.countPaidBefore(sub.userId, sub.startsAt)) > 0 ? "renewed" : "first_paid";
+  }
+}
+
+// ---------------------------------------------------------------- reading it back
+
+export type CustomerStatus = "paid" | "trial" | "comped" | "expired" | "free";
+
+/**
+ * Where an account stands at `at`: paid (a razorpay row covers now), trial,
+ * comped (a coupon or admin row covers now), expired (had rows, none now),
+ * free (never had one, or the app has no plans).
+ */
+export function statusOf(subs: Sub[], at: Date): { status: CustomerStatus; plan: string | null; endsAt: Date | null } {
+  const now = at.getTime();
+  const current = subs
+    .filter((s) => s.startsAt.getTime() <= now && now < s.endsAt.getTime())
+    .sort((a, b) => b.endsAt.getTime() - a.endsAt.getTime());
+  const rank = { razorpay: 0, coupon: 1, admin: 1, trial: 2 } as const;
+  current.sort((a, b) => rank[a.source] - rank[b.source]);
+  const top = current[0];
+  if (top) {
+    const status: CustomerStatus = top.source === "razorpay" ? "paid" : top.source === "trial" ? "trial" : "comped";
+    const endsAt = new Date(Math.max(...current.map((s) => s.endsAt.getTime())));
+    return { status, plan: top.planName ?? top.planId, endsAt };
+  }
+  if (subs.length) {
+    const last = [...subs].sort((a, b) => b.endsAt.getTime() - a.endsAt.getTime())[0];
+    return { status: "expired", plan: last.planName ?? last.planId, endsAt: last.endsAt };
+  }
+  return { status: "free", plan: null, endsAt: null };
+}
+
+export type CustomerRow = {
+  id: string;
+  name: string | null;
+  email: string | null;
+  phone: string | null;
+  registeredAt: Date;
+  status: CustomerStatus;
+  plan: string | null;
+  endsAt: Date | null;
+  city: string | null;
+  region: string | null;
+  country: string | null;
+  features: string[]; // features used that day
+  hits: number;
+  events: EventKind[]; // events that day
+};
+
+export type DailyReport = {
+  day: string;
+  timeZone: string;
+  totals: {
+    registrations: number;
+    trialsStarted: number;
+    firstPayments: number;
+    renewals: number;
+    grants: number;
+    refunds: number;
+    revenue: { currency: string; amount: number }[]; // first payments + renewals, minus nothing (refunds shown apart)
+    visitors: number; // distinct visitors, signed in or not
+    signedInVisitors: number;
+    anonymousVisitors: number;
+    pageViews: number;
+  };
+  byFeature: { feature: string; visitors: number; customers: number; pageViews: number }[];
+  byPlace: { country: string; region: string; city: string; visitors: number; customers: number }[];
+  byStatus: Record<CustomerStatus, number>; // of the customers seen that day
+  customers: CustomerRow[]; // everyone with an event or a signed-in visit that day
+};
+
+const UNKNOWN = "Unknown";
+
+/** Everything for one day, as the admin screen and the admin API show it. */
+export async function dailyReport(store: UsageStore, cfg: Pick<UsageConfig, "timeZone">, day: string, now = new Date()): Promise<DailyReport> {
+  const [events, visits] = await Promise.all([store.eventsOn(day), store.visitsOn(day)]);
+  const count = (k: EventKind) => events.filter((e) => e.kind === k).length;
+
+  const revenue = new Map<string, number>();
+  for (const e of events)
+    if ((e.kind === "first_paid" || e.kind === "renewed") && e.amount != null)
+      revenue.set(e.currency ?? "INR", (revenue.get(e.currency ?? "INR") ?? 0) + e.amount);
+
+  const visitors = new Set(visits.map((v) => v.visitorKey));
+  const signedIn = new Set(visits.filter((v) => v.userId).map((v) => v.visitorKey));
+
+  const feat = new Map<string, { v: Set<string>; c: Set<string>; h: number }>();
+  for (const v of visits) {
+    const f = feat.get(v.feature) ?? { v: new Set(), c: new Set(), h: 0 };
+    f.v.add(v.visitorKey);
+    if (v.userId) f.c.add(v.userId);
+    f.h += v.hits;
+    feat.set(v.feature, f);
+  }
+
+  // A visitor's place for the day: their first visit row with a country.
+  const placeOfVisitor = new Map<string, Place>();
+  for (const v of [...visits].sort((a, b) => a.firstAt.getTime() - b.firstAt.getTime()))
+    if (!placeOfVisitor.has(v.visitorKey) || (!placeOfVisitor.get(v.visitorKey)!.country && v.country))
+      placeOfVisitor.set(v.visitorKey, { city: v.city, region: v.region, country: v.country });
+  const places = new Map<string, { country: string; region: string; city: string; v: Set<string>; c: Set<string> }>();
+  for (const [key, p] of placeOfVisitor) {
+    const country = p.country ?? UNKNOWN;
+    const region = p.region ?? UNKNOWN;
+    const city = p.city ?? UNKNOWN;
+    const id = `${country}\u0000${region}\u0000${city}`;
+    const row = places.get(id) ?? { country, region, city, v: new Set(), c: new Set() };
+    row.v.add(key);
+    if (key.startsWith("u:")) row.c.add(key);
+    places.set(id, row);
+  }
+
+  const ids = [...new Set([...events.map((e) => e.userId), ...visits.flatMap((v) => (v.userId ? [v.userId] : []))])];
+  const [people, subs] = await Promise.all([store.customers(ids), store.subscriptions(ids)]);
+  const subsOf = new Map<string, Sub[]>();
+  for (const s of subs) subsOf.set(s.userId, [...(subsOf.get(s.userId) ?? []), s]);
+  const byStatus: Record<CustomerStatus, number> = { paid: 0, trial: 0, comped: 0, expired: 0, free: 0 };
+  const customers: CustomerRow[] = people
+    .filter((p) => !p.isAdmin)
+    .map((p) => {
+      const mine = visits.filter((v) => v.userId === p.id);
+      const firstWithPlace = mine.find((v) => v.country);
+      const ev = events.filter((e) => e.userId === p.id);
+      const evPlace = ev.find((e) => e.country);
+      const st = statusOf(subsOf.get(p.id) ?? [], now);
+      byStatus[st.status]++;
+      return {
+        id: p.id,
+        name: p.name,
+        email: p.email,
+        phone: p.phone,
+        registeredAt: p.createdAt,
+        status: st.status,
+        plan: st.plan,
+        endsAt: st.endsAt,
+        city: firstWithPlace?.city ?? evPlace?.city ?? p.city ?? null,
+        region: firstWithPlace?.region ?? evPlace?.region ?? p.region ?? null,
+        country: firstWithPlace?.country ?? evPlace?.country ?? p.country ?? null,
+        features: [...new Set(mine.map((v) => v.feature))].sort(),
+        hits: mine.reduce((n, v) => n + v.hits, 0),
+        events: ev.map((e) => e.kind),
+      };
+    })
+    .sort((a, b) => b.events.length - a.events.length || b.hits - a.hits || (a.name ?? "").localeCompare(b.name ?? ""));
+
+  return {
+    day,
+    timeZone: cfg.timeZone,
+    totals: {
+      registrations: count("registered"),
+      trialsStarted: count("trial_started"),
+      firstPayments: count("first_paid"),
+      renewals: count("renewed"),
+      grants: count("coupon_grant") + count("admin_grant"),
+      refunds: count("refunded"),
+      revenue: [...revenue].map(([currency, amount]) => ({ currency, amount })),
+      visitors: visitors.size,
+      signedInVisitors: signedIn.size,
+      anonymousVisitors: visitors.size - signedIn.size,
+      pageViews: visits.reduce((n, v) => n + v.hits, 0),
+    },
+    byFeature: [...feat]
+      .map(([feature, f]) => ({ feature, visitors: f.v.size, customers: f.c.size, pageViews: f.h }))
+      .sort((a, b) => b.visitors - a.visitors || a.feature.localeCompare(b.feature)),
+    byPlace: [...places.values()]
+      .map((p) => ({ country: p.country, region: p.region, city: p.city, visitors: p.v.size, customers: p.c.size }))
+      .sort((a, b) => b.visitors - a.visitors || a.country.localeCompare(b.country) || a.city.localeCompare(b.city)),
+    byStatus,
+    customers,
+  };
+}
+
+/** Roll the place table up to state or country level for the summary view. */
+export function summarisePlaces(rows: DailyReport["byPlace"], level: "country" | "region"): { place: string; visitors: number; customers: number }[] {
+  const m = new Map<string, { visitors: number; customers: number }>();
+  for (const r of rows) {
+    const key = level === "country" ? r.country : `${r.region}, ${r.country}`;
+    const t = m.get(key) ?? { visitors: 0, customers: 0 };
+    t.visitors += r.visitors;
+    t.customers += r.customers;
+    m.set(key, t);
+  }
+  return [...m].map(([place, t]) => ({ place, ...t })).sort((a, b) => b.visitors - a.visitors || a.place.localeCompare(b.place));
+}
+
+// ---------------------------------------------------------------- export and upkeep
+
+/** A CSV cell, quoted, with spreadsheet formulas defused (=, +, -, @, tab, CR). */
+export function csvCell(v: unknown): string {
+  let s = v == null ? "" : v instanceof Date ? v.toISOString() : String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+export function customersCsv(rows: CustomerRow[]): string {
+  const head = ["Name", "Email", "Phone", "Status", "Plan", "Ends", "Registered", "City", "State", "Country", "Features", "Page views", "Events"];
+  const lines = rows.map((r) =>
+    [r.name, r.email, r.phone, r.status, r.plan, r.endsAt, r.registeredAt, r.city, r.region, r.country, r.features.join(" "), r.hits, r.events.join(" ")]
+      .map(csvCell)
+      .join(","),
+  );
+  return `﻿${[head.map(csvCell).join(","), ...lines].join("\r\n")}\r\n`;
+}
+
+/** Delete visit rows older than the retention window. Run once a day. Events stay with the account. */
+export async function prune(store: UsageStore, cfg: Pick<UsageConfig, "timeZone" | "retentionDays">, now = new Date()): Promise<number> {
+  return store.deleteVisitsBefore(daysBefore(dayOf(now, cfg.timeZone), cfg.retentionDays));
+}

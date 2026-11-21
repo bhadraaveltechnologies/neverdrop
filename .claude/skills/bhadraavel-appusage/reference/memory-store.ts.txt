@@ -1,0 +1,89 @@
+// A working in-memory UsageStore (the tests run on it). Each method carries
+// the SQL the real store runs against reference/schema.sql: port it to the
+// app's database layer and keep the behaviour.
+
+import type { Customer, Place, Sub, UsageEvent, UsageStore, Visit } from "./usage.ts";
+
+export function memoryStore(seed: { customers?: Customer[]; subs?: Sub[] } = {}) {
+  const events: UsageEvent[] = [];
+  const visits = new Map<string, Visit>();
+  const people = new Map((seed.customers ?? []).map((c) => [c.id, { ...c }]));
+  const subs: Sub[] = [...(seed.subs ?? [])];
+
+  const store: UsageStore & {
+    events: UsageEvent[];
+    visits: Map<string, Visit>;
+    people: Map<string, Customer>;
+    subs: Sub[];
+  } = {
+    events,
+    visits,
+    people,
+    subs,
+
+    // INSERT INTO usage_events (id, at, day, kind, user_id, plan_id, amount, currency, source, city, region, country)
+    // VALUES (…) ON CONFLICT (id) DO NOTHING
+    async insertEvent(e) {
+      if (!events.some((x) => x.id === e.id)) events.push({ ...e });
+    },
+
+    // INSERT INTO usage_visits (day, feature, visitor_key, user_id, city, region, country, hits, first_at, last_at)
+    // VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$8)
+    // ON CONFLICT (day, feature, visitor_key) DO UPDATE SET hits = usage_visits.hits + 1, last_at = EXCLUDED.last_at,
+    //   city = COALESCE(usage_visits.city, EXCLUDED.city), region = COALESCE(usage_visits.region, EXCLUDED.region),
+    //   country = COALESCE(usage_visits.country, EXCLUDED.country)
+    async upsertVisit(v, at) {
+      const key = `${v.day}|${v.feature}|${v.visitorKey}`;
+      const old = visits.get(key);
+      if (old) {
+        old.hits += 1;
+        old.lastAt = at;
+        old.city ??= v.city;
+        old.region ??= v.region;
+        old.country ??= v.country;
+      } else visits.set(key, { ...v, hits: 1, firstAt: at, lastAt: at });
+    },
+
+    // SELECT * FROM usage_events WHERE day = $1 ORDER BY at
+    async eventsOn(day) {
+      return events.filter((e) => e.day === day).sort((a, b) => a.at.getTime() - b.at.getTime());
+    },
+
+    // SELECT * FROM usage_visits WHERE day = $1
+    async visitsOn(day) {
+      return [...visits.values()].filter((v) => v.day === day);
+    },
+
+    // SELECT id, name, email, phone, created_at, is_admin, last_city AS city, last_region AS region,
+    //   last_country AS country FROM users WHERE id = ANY($1)
+    async customers(ids) {
+      return ids.flatMap((id) => (people.has(id) ? [{ ...people.get(id)! }] : []));
+    },
+
+    // SELECT s.user_id, s.plan_id, p.name AS plan_name, s.source, s.starts_at, s.ends_at
+    // FROM subscriptions s LEFT JOIN billing_plans p ON p.id = s.plan_id WHERE s.user_id = ANY($1)
+    // (an app without plans returns [])
+    async subscriptions(ids) {
+      return subs.filter((s) => ids.includes(s.userId));
+    },
+
+    // SELECT count(*) FROM subscriptions WHERE user_id = $1 AND source = 'razorpay' AND starts_at < $2
+    async countPaidBefore(userId, before) {
+      return subs.filter((s) => s.userId === userId && s.source === "razorpay" && s.startsAt < before).length;
+    },
+
+    // UPDATE users SET last_city = $2, last_region = $3, last_country = $4, last_seen_at = $5 WHERE id = $1
+    async setLastPlace(userId, place: Place, _at) {
+      const p = people.get(userId);
+      if (p) Object.assign(p, place);
+    },
+
+    // DELETE FROM usage_visits WHERE day < $1
+    async deleteVisitsBefore(day) {
+      let n = 0;
+      for (const [k, v] of visits) if (v.day < day) (visits.delete(k), n++);
+      return n;
+    },
+  };
+  return store;
+}

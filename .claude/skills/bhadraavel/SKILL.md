@@ -41,6 +41,7 @@ about what is missing, not what is done. Cheap markers:
 | `bhadraavel-razorpay` | `RAZORPAY_KEY_ID` in `.env.example`, a `billing` module, `/pricing` |
 | `bhadraavel-image-editor` | an `ImageEditor` component |
 | `bhadraavel-share` | a Share button / `share` module |
+| `bhadraavel-appusage` | a `usage_events` table, `/admin/usage`, `USAGE_SALT_SECRET` in `.env.example` |
 | `bhadraavel-testenablement` | `tests/e2e/lib/test-results.mjs` and a `test-results/` folder |
 | `github-vps-deploy` | `.github/workflows/deploy.yml` and `deploy/redeploy.sh` |
 
@@ -85,11 +86,12 @@ one-line reason per step and let the user drop steps.
 | 4 | `bhadraavel-support` | Help links, the help form, "Your requests"; registers the app on the hub and hands over the key |
 | 5 | `bhadraavel-error-reporting` | same key, switch on the hub; the gentle error page links to Help from step 4 |
 | 6 | `bhadraavel-razorpay` — **only if the app is paid** | plans, checkout, wall, policy pages; the footer's Refunds/Terms links start working |
-| 7 | `bhadraavel-image-editor` — **only if there is a logo or people's photos** | operator-only uploads |
-| 8 | `bhadraavel-share` — **only for apps with a result or a screen worth sharing** | the Share button |
-| 9 | `github-vps-deploy` | CI on pull requests, auto-redeploy on main; last, once there is something to deploy |
+| 7 | `bhadraavel-appusage` | registrations, renewals, visitors per feature and the customer list; after payments, so trial vs paid and renewals are counted from day one |
+| 8 | `bhadraavel-image-editor` — **only if there is a logo or people's photos** | operator-only uploads |
+| 9 | `bhadraavel-share` — **only for apps with a result or a screen worth sharing** | the Share button |
+| 10 | `github-vps-deploy` | CI on pull requests, auto-redeploy on main; last, once there is something to deploy |
 
-Ask about 6, 7 and 8 in one question (multi-select) before starting.
+Ask about 6, 8 and 9 in one question (multi-select) before starting.
 
 ### B. Add payments to an existing app
 
@@ -98,6 +100,7 @@ Ask about 6, 7 and 8 in one question (multi-select) before starting.
 | 1 | `bhadraavel-footer` *(if missing)* | Refunds, Terms and Privacy links must exist for Razorpay's review |
 | 2 | `bhadraavel-razorpay` | plans, checkout, webhook, wall, coupons, admin, policy pages |
 | 3 | `bhadraavel-support` *(if missing)* | "Questions? Help reaches us" on the pricing wall and payment failures; the razorpay skill links to it |
+| 4 | `bhadraavel-appusage` *(if missing)* | first payments, renewals and revenue by day, with the customer list |
 
 ### C. Connect to the support desk and the error bus
 
@@ -160,7 +163,7 @@ missing ones as a bundle in the order of A.
 
 When asked for the whole catalog, print it as a table — `/<name>` and
 the first sentence of its description — grouped as: **start** (appreq),
-**every app** (footer, support, error-reporting, deploy), **paid apps**
+**every app** (footer, support, error-reporting, appusage, deploy), **paid apps**
 (razorpay), **images and sharing** (image-editor, gemini-image, share),
 **testing** (testenablement),
 **other** (anything else installed). Then ask which to run.
