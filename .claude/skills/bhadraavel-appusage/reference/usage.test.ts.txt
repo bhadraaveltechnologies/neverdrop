@@ -1,0 +1,232 @@
+// In the skill this is usage.test.ts.txt; scripts/test-references.sh in the
+// SkillFactory copies it out as usage.test.ts and runs it with `node --test`.
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { memoryStore } from "./memory-store.ts";
+import {
+  type GeoLookup,
+  type UsageConfig,
+  DEFAULT_IGNORE,
+  anonymousKey,
+  clientIp,
+  csvCell,
+  customersCsv,
+  dailyReport,
+  dayOf,
+  daysBefore,
+  eventForSubscription,
+  featureOf,
+  isBot,
+  placeOf,
+  prune,
+  statusOf,
+  summarisePlaces,
+  trackEvent,
+  trackVisit,
+} from "./usage.ts";
+
+const CFG: UsageConfig = {
+  timeZone: "Asia/Kolkata",
+  saltSecret: "test-secret",
+  features: [
+    { feature: "Home", match: /^\/$/ },
+    { feature: "Calendar", match: /^\/calendar(\/|$)/ },
+    { feature: "Notes", match: /^\/notes(\/|$)/ },
+    { feature: "Pricing", match: /^\/pricing$/ },
+  ],
+  ignore: DEFAULT_IGNORE,
+  retentionDays: 400,
+};
+const CHROME = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/130 Mobile Safari/537.36";
+const geo: GeoLookup = {
+  lookup: (ip) =>
+    ip.startsWith("49.")
+      ? { city: "Chennai", region: "Tamil Nadu", country: "IN" }
+      : ip.startsWith("110.")
+        ? { city: "Bengaluru", region: "Karnataka", country: "IN" }
+        : ip.startsWith("8.")
+          ? { city: "Kuala Lumpur", region: "Kuala Lumpur", country: "MY" }
+          : { city: null, region: null, country: null },
+};
+const req = (path: string, ip: string, extra: Partial<Parameters<typeof trackVisit>[3]> = {}) => ({
+  path,
+  method: "GET",
+  headers: { "user-agent": CHROME, "x-forwarded-for": `${ip}, 172.18.0.2` },
+  remoteAddress: "172.18.0.2",
+  behindProxy: true,
+  ...extra,
+});
+
+test("the day is the app's calendar day, not UTC's", () => {
+  // 20:00 UTC on the 20th is 01:30 on the 21st in India.
+  assert.equal(dayOf(new Date("2026-11-20T20:00:00Z"), "Asia/Kolkata"), "2026-11-21");
+  assert.equal(dayOf(new Date("2026-11-20T20:00:00Z"), "UTC"), "2026-11-20");
+  assert.equal(daysBefore("2026-03-01", 1), "2026-02-28");
+});
+
+test("the client IP comes from the proxy header only behind a proxy", () => {
+  const h = { "x-forwarded-for": "49.37.1.2, 10.0.0.1" };
+  assert.equal(clientIp(h, "10.0.0.1", true), "49.37.1.2");
+  assert.equal(clientIp(h, "::ffff:10.0.0.1", false), "10.0.0.1");
+});
+
+test("a place comes from the CDN's headers first, then the lookup, never from a private address", async () => {
+  assert.deepEqual(await placeOf({ "cf-ipcountry": "IN", "cf-ipcity": "Madurai", "cf-region": "Tamil Nadu" }, "49.1.1.1", geo), {
+    city: "Madurai",
+    region: "Tamil Nadu",
+    country: "IN",
+  });
+  assert.equal((await placeOf({}, "49.1.1.1", geo)).city, "Chennai");
+  assert.equal((await placeOf({}, "192.168.1.5", geo)).country, null);
+  assert.equal((await placeOf({ "cf-ipcountry": "XX" }, "8.8.8.8", geo)).country, "MY");
+  const broken: GeoLookup = { lookup: () => { throw new Error("no database"); } };
+  assert.equal((await placeOf({}, "49.1.1.1", broken)).country, null);
+});
+
+test("features: assets, APIs, admin and health checks are not counted; unknown pages are 'other'", () => {
+  assert.equal(featureOf("/calendar/2026-11?x=1", CFG), "Calendar");
+  assert.equal(featureOf("/", CFG), "Home");
+  assert.equal(featureOf("/settings", CFG), "other");
+  for (const p of ["/_next/static/a.js", "/styles.css", "/api/notes", "/admin/usage", "/healthz", "/favicon.ico"])
+    assert.equal(featureOf(p, CFG), null, p);
+});
+
+test("bots and empty user agents are not visitors", () => {
+  assert.ok(isBot(undefined));
+  assert.ok(isBot("Googlebot/2.1"));
+  assert.ok(isBot("WhatsApp/2.23"));
+  assert.ok(!isBot(CHROME));
+});
+
+test("a signed-out visitor keeps one key for the day and a different one the next day", () => {
+  const a = anonymousKey("49.1.1.1", CHROME, "2026-11-21", "s");
+  assert.equal(a, anonymousKey("49.1.1.1", CHROME, "2026-11-21", "s"));
+  assert.notEqual(a, anonymousKey("49.1.1.1", CHROME, "2026-11-22", "s"));
+  assert.notEqual(a, anonymousKey("49.1.1.2", CHROME, "2026-11-21", "s"));
+  assert.ok(!a.includes("49.1.1.1"));
+});
+
+test("visits: one row per visitor per feature per day, hits counted, no IP kept", async () => {
+  const store = memoryStore({ customers: [{ id: "u1", name: "Meena", email: "m@x.in", phone: "+91 98400 00001", createdAt: new Date() }] });
+  const at = new Date("2026-11-21T05:00:00Z");
+  await trackVisit(store, geo, CFG, req("/calendar", "49.1.1.1", { at }));
+  await trackVisit(store, geo, CFG, req("/calendar/12", "49.1.1.1", { at }));
+  await trackVisit(store, geo, CFG, req("/notes", "49.1.1.1", { at }));
+  await trackVisit(store, geo, CFG, req("/calendar", "110.1.1.1", { at, user: { id: "u1" } }));
+  const rows = [...store.visits.values()];
+  assert.equal(rows.length, 3);
+  assert.equal(rows.find((r) => r.feature === "Calendar" && !r.userId)?.hits, 2);
+  assert.ok(!JSON.stringify(rows).includes("49.1.1.1"));
+  assert.equal(store.people.get("u1")?.city, "Bengaluru"); // last place kept on the account
+});
+
+test("not counted: bots, POSTs, prefetches, the team's own visits", async () => {
+  const store = memoryStore();
+  const at = new Date("2026-11-21T05:00:00Z");
+  assert.equal(await trackVisit(store, geo, CFG, req("/", "49.1.1.1", { at, headers: { "user-agent": "Googlebot" } })), null);
+  assert.equal(await trackVisit(store, geo, CFG, req("/", "49.1.1.1", { at, method: "POST" })), null);
+  assert.equal(await trackVisit(store, geo, CFG, req("/", "49.1.1.1", { at, headers: { "user-agent": CHROME, purpose: "prefetch" } })), null);
+  assert.equal(await trackVisit(store, geo, CFG, req("/", "49.1.1.1", { at, user: { id: "a", isAdmin: true } })), null);
+  assert.equal(store.visits.size, 0);
+});
+
+test("a paid subscription is a first payment, then a renewal; trial, coupon and admin rows name themselves", async () => {
+  const store = memoryStore({
+    subs: [{ userId: "u1", planId: "m", source: "razorpay", startsAt: new Date("2026-10-01"), endsAt: new Date("2026-11-01") }],
+  });
+  const at = new Date("2026-11-21");
+  assert.equal(await eventForSubscription(store, { userId: "u1", planId: "m", source: "razorpay", startsAt: at, endsAt: at }), "renewed");
+  assert.equal(await eventForSubscription(store, { userId: "u2", planId: "m", source: "razorpay", startsAt: at, endsAt: at }), "first_paid");
+  assert.equal(await eventForSubscription(store, { userId: "u2", planId: null, source: "trial", startsAt: at, endsAt: at }), "trial_started");
+  assert.equal(await eventForSubscription(store, { userId: "u2", planId: "m", source: "coupon", startsAt: at, endsAt: at }), "coupon_grant");
+  assert.equal(await eventForSubscription(store, { userId: "u2", planId: "m", source: "admin", startsAt: at, endsAt: at }), "admin_grant");
+});
+
+test("status: paid beats a trial covering the same day; expired and free are told apart", () => {
+  const now = new Date("2026-11-21T00:00:00Z");
+  const d = (s: string) => new Date(s);
+  const trial = { userId: "u", planId: null, planName: "Trial", source: "trial" as const, startsAt: d("2026-11-15"), endsAt: d("2026-11-29") };
+  const paid = { userId: "u", planId: "y", planName: "Yearly", source: "razorpay" as const, startsAt: d("2026-11-20"), endsAt: d("2027-11-20") };
+  assert.equal(statusOf([trial], now).status, "trial");
+  assert.deepEqual(statusOf([trial, paid], now), { status: "paid", plan: "Yearly", endsAt: d("2027-11-20") });
+  assert.equal(statusOf([{ ...paid, source: "coupon" }], now).status, "comped");
+  assert.equal(statusOf([{ ...paid, startsAt: d("2025-01-01"), endsAt: d("2025-02-01") }], now).status, "expired");
+  assert.equal(statusOf([], now).status, "free");
+});
+
+test("the daily report: registrations, renewals, revenue, visitors by feature and place, and every customer seen", async () => {
+  const day = "2026-11-21";
+  const at = new Date("2026-11-21T06:00:00Z");
+  const store = memoryStore({
+    customers: [
+      { id: "u1", name: "Meena", email: "meena@example.in", phone: "+91 98400 00001", createdAt: at },
+      { id: "u2", name: "Arun", email: "arun@example.in", phone: null, createdAt: new Date("2026-01-05") },
+      { id: "u3", name: "Siti", email: "siti@example.my", phone: "+60 12 000 0000", createdAt: new Date("2026-06-01") },
+      { id: "adm", name: "Ops", email: "ops@bhadraaveltechnologies.com", phone: null, createdAt: at, isAdmin: true },
+    ],
+    subs: [
+      { userId: "u1", planId: null, planName: "Trial", source: "trial", startsAt: at, endsAt: new Date("2026-12-05") },
+      { userId: "u2", planId: "y", planName: "Yearly", source: "razorpay", startsAt: new Date("2025-11-21"), endsAt: new Date("2026-11-21T05:00:00Z") },
+      { userId: "u2", planId: "y", planName: "Yearly", source: "razorpay", startsAt: at, endsAt: new Date("2027-11-21") },
+    ],
+  });
+  const chennai = { city: "Chennai", region: "Tamil Nadu", country: "IN" };
+  await trackEvent(store, CFG, { kind: "registered", userId: "u1", place: chennai, at });
+  await trackEvent(store, CFG, { kind: "trial_started", userId: "u1", source: "trial", place: chennai, at });
+  await trackEvent(store, CFG, { kind: "renewed", userId: "u2", planId: "y", amount: 99900, currency: "INR", source: "razorpay", at });
+  await trackEvent(store, CFG, { kind: "registered", userId: "u9", at: new Date("2026-11-20T10:00:00Z") }); // the day before
+
+  await trackVisit(store, geo, CFG, req("/calendar", "49.1.1.1", { at, user: { id: "u1" } }));
+  await trackVisit(store, geo, CFG, req("/notes", "49.1.1.1", { at, user: { id: "u1" } }));
+  await trackVisit(store, geo, CFG, req("/calendar", "110.1.1.1", { at, user: { id: "u2" } }));
+  await trackVisit(store, geo, CFG, req("/pricing", "8.8.8.8", { at, user: { id: "u3" } }));
+  await trackVisit(store, geo, CFG, req("/", "49.2.2.2", { at }));
+  await trackVisit(store, geo, CFG, req("/", "49.2.2.2", { at }));
+  await trackVisit(store, geo, CFG, req("/calendar", "49.3.3.3", { at }));
+
+  const r = await dailyReport(store, CFG, day, at);
+  assert.equal(r.totals.registrations, 1);
+  assert.equal(r.totals.trialsStarted, 1);
+  assert.equal(r.totals.renewals, 1);
+  assert.equal(r.totals.firstPayments, 0);
+  assert.deepEqual(r.totals.revenue, [{ currency: "INR", amount: 99900 }]);
+  assert.equal(r.totals.visitors, 5);
+  assert.equal(r.totals.signedInVisitors, 3);
+  assert.equal(r.totals.anonymousVisitors, 2);
+  assert.equal(r.totals.pageViews, 7);
+  assert.deepEqual(r.byFeature[0], { feature: "Calendar", visitors: 3, customers: 2, pageViews: 3 });
+  assert.deepEqual(summarisePlaces(r.byPlace, "country"), [
+    { place: "IN", visitors: 4, customers: 2 },
+    { place: "MY", visitors: 1, customers: 1 },
+  ]);
+  assert.deepEqual(r.byStatus, { paid: 1, trial: 1, comped: 0, expired: 0, free: 1 });
+  const meena = r.customers.find((c) => c.id === "u1")!;
+  assert.equal(meena.status, "trial");
+  assert.equal(meena.phone, "+91 98400 00001");
+  assert.equal(meena.city, "Chennai");
+  assert.deepEqual(meena.features, ["Calendar", "Notes"]);
+  assert.deepEqual(meena.events, ["registered", "trial_started"]);
+  assert.equal(r.customers.find((c) => c.id === "u2")?.status, "paid");
+  assert.ok(!r.customers.some((c) => c.id === "adm"));
+  assert.ok(!r.customers.some((c) => c.id === "u9"));
+});
+
+test("CSV: quoted, with formulas defused and a BOM for Excel", () => {
+  assert.equal(csvCell('=HYPERLINK("x")'), `"'=HYPERLINK(""x"")"`);
+  assert.equal(csvCell("+91 98400 00001"), `"'+91 98400 00001"`);
+  assert.equal(csvCell(null), `""`);
+  const csv = customersCsv([
+    { id: "u", name: "Meena, R", email: "m@x.in", phone: null, registeredAt: new Date("2026-11-21T00:00:00Z"), status: "trial", plan: "Trial", endsAt: null, city: "Chennai", region: "Tamil Nadu", country: "IN", features: ["Notes"], hits: 2, events: ["registered"] },
+  ]);
+  assert.ok(csv.startsWith("﻿\"Name\""));
+  assert.ok(csv.includes(`"Meena, R"`));
+});
+
+test("prune keeps the retention window of visits", async () => {
+  const store = memoryStore();
+  for (const day of ["2025-01-01", "2025-11-01", "2026-11-21"])
+    await store.upsertVisit({ day, feature: "Home", visitorKey: "a:x", userId: null, city: null, region: null, country: null }, new Date());
+  const removed = await prune(store, { timeZone: "Asia/Kolkata", retentionDays: 400 }, new Date("2026-11-21T06:00:00Z"));
+  assert.equal(removed, 1);
+  assert.equal(store.visits.size, 2);
+});
