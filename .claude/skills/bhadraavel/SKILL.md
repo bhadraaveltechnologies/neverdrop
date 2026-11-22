@@ -43,6 +43,7 @@ about what is missing, not what is done. Cheap markers:
 | `bhadraavel-share` | a Share button / `share` module |
 | `bhadraavel-appusage` | a `usage_events` table, `/admin/usage`, `USAGE_SALT_SECRET` in `.env.example` |
 | `bhadraavel-testenablement` | `tests/e2e/lib/test-results.mjs` and a `test-results/` folder |
+| `bhadraavel-android` | `twa/twa-manifest.json` and a `.well-known/assetlinks.json` |
 | `github-vps-deploy` | `.github/workflows/deploy.yml` and `deploy/redeploy.sh` |
 
 Say what you found in one short list ("Already here: footer, support
@@ -143,6 +144,15 @@ whenever the user asks for proof, test results or screenshots. It needs
 the app running locally with its database; it never runs against a real
 customer.
 
+### H. Publish on the Play Store (Android)
+
+| Step | Skill | Why |
+|---|---|---|
+| 1 | `bhadraavel-footer` *(if missing)* | the Privacy link the Play listing needs |
+| 2 | `bhadraavel-support` *(if missing)* | a way to request account deletion, which Google requires |
+| 3 | `bhadraavel-razorpay`'s store build *(paid apps, if missing)* | nothing is sold inside the Play app |
+| 4 | `bhadraavel-android` | the wrapper, `assetlinks.json`, the signed app and the Play Console |
+
 ### G. Keep an app to the standard (audit, then fix)
 
 Section 2 in full, as a table of applied / missing, then offer to run the
@@ -166,6 +176,7 @@ the first sentence of its description — grouped as: **start** (appreq),
 **every app** (footer, support, error-reporting, appusage, deploy), **paid apps**
 (razorpay), **images and sharing** (image-editor, gemini-image, share),
 **testing** (testenablement),
+**mobile** (android),
 **other** (anything else installed). Then ask which to run.
 
 ## 7. Adding a skill to the factory
